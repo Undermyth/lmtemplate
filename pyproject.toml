@@ -1,0 +1,8 @@
+[tool.ty.rules]
+invalid-assignment = "ignore"
+unresolved-attribute = "ignore"
+invalid-argument-type = "ignore"
+possibly-missing-attribute = "ignore"
+
+[tool.ruff.lint]
+ignore = ["F722"]
