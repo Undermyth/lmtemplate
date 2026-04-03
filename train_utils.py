@@ -82,8 +82,8 @@ def get_checkpoint_steps(
     '''
     n_tokens = n_checkpoint_tokens * 1024 * 1024 * 1024
     tokens_per_batch = n_gpus * micro_batch_size * seq_len
-    every_n_train_steps = n_tokens / tokens_per_batch / n_grad_accum_steps * n_optimizers
-    return int(every_n_train_steps)
+    every_n_train_steps = int(n_tokens / tokens_per_batch / n_grad_accum_steps) * n_optimizers
+    return every_n_train_steps
 
 def get_optimizer_steps(
     n_optimize_tokens: int,     # token count within the planned scheduler epoch (in billion)
@@ -102,3 +102,33 @@ def get_optimizer_steps(
     tokens_per_batch = n_gpus * micro_batch_size * seq_len
     optimizer_steps = n_tokens / tokens_per_batch / n_grad_accum_steps
     return int(optimizer_steps)
+
+def get_eval_steps(
+    every_n_train_steps: int,    # return value of `get_checkpoint_steps`
+    n_eval_per_checkpoint: int,  # run evaluation for n times per checkpoint epoch 
+    n_optimizers: int,           # number of optimizers used in the model
+    n_grad_accum_steps: int,     # steps of gradient accumulation
+    n_gpus: int,
+    micro_batch_size: int,       # batch size per gpu
+    seq_len: int                 # training sequence length
+) -> int:
+    '''
+    by specifying `n_eval_per_checkpoint`, we aim to run evaluation every n_token / n_eval_per_checkpoint, 
+    where n_token refer to `n_checkpoint_tokens`.
+    `val_check_interval` in Lightning is counted in batch, so we have
+
+    val_check_interval * n_gpus * micro_batch_size * seq_len = n_tokens / n_eval_per_checkpoint
+    └────────────────┘   └─────────────────────────────────┘
+        batch steps                tokens per batch
+
+    combined with calculation in `get_checkpoint_steps`, we have
+
+    every_n_train_steps / n_optimizers * n_grad_accum_steps = val_check_interval * n_eval_per_checkpoint
+    └─────────────────────────────────────────────────────┘
+                          batch steps
+
+    LHS is sure to be integer, so we only need to assert that batch_steps % n_eval_per_checkpoint == 0
+    '''
+    batch_steps = every_n_train_steps / n_optimizers * n_grad_accum_steps
+    assert batch_steps % n_eval_per_checkpoint == 0, f'batch steps ({batch_steps}) can not be divided by n_eval_per_checkpoint ({n_eval_per_checkpoint})'
+    return int(batch_steps / n_eval_per_checkpoint)

@@ -220,3 +220,4 @@ checkpoints/
 logs/
 wandb/
 lightning_logs/
+.vscode/

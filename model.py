@@ -1,12 +1,13 @@
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 import lightning as L
-import lm_eval
+import lm_eval  # type: ignore
 import torch
-from lm_eval.models.huggingface import HFLM
-from lm_eval.tasks import TaskManager
+from lm_eval.models.huggingface import HFLM  # type: ignore
+from lm_eval.tasks import TaskManager  # type: ignore
+from rich.pretty import pprint
 from torch.utils.data import DataLoader
 
 from data.stream_parquet import StreamingParquet
@@ -37,6 +38,7 @@ class LanguageModel(L.LightningModule):
         grad_accum_steps: int, 
         n_gpus: int,
         optimize_tokens: int,
+        eval_tasks: List[str],
         optimizer: Literal["adam", "muon"] = "muon",
         optimize_config: OptimizeConfig = OptimizeConfig(),
     ):
@@ -49,6 +51,7 @@ class LanguageModel(L.LightningModule):
         self.grad_accum = grad_accum_steps
         self.n_gpus = n_gpus
         self.optimize_tokens = optimize_tokens
+        self.eval_tasks = eval_tasks
         self.optimizer = optimizer
         self.optimize_config = optimize_config
         self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -97,7 +100,11 @@ class LanguageModel(L.LightningModule):
             if not isinstance(schs, list):
                 schs = [schs]
 
-            # optimize and schedule    
+            # compute grad norm before update
+            total_norm = torch.stack([torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]).pow(2).sum().pow(0.5)
+            self.log('train/grad_norm', total_norm, on_step=True, prog_bar=False, logger=True, sync_dist=True)
+
+            # optimize and schedule
             for opt in opts:
                 if self.optimize_config.grad_clip is not None:
                     self.clip_gradients(opt, gradient_clip_val=self.optimize_config.grad_clip, gradient_clip_algorithm='norm')
@@ -119,33 +126,36 @@ class LanguageModel(L.LightningModule):
         pass
 
     def on_validation_epoch_end(self):
-        self.model.device = torch.device(f'cuda:{self.global_rank}')
-        model = HFLM(
-            pretrained=self.model,
-            tokenizer=self.tokenizer,
-            backend='causal',
-            add_bos_token=True
-        )
-        task_manager = TaskManager(
-            metadata={
-                "max_seq_lengths": [1024, 2048, 4096, 8192],
-                "tokenizer": self.tokenizer,
-                "shuffle": True,
-                "enable_cache": True,
-                "num_samples": 500,
-            },
-        )
-        results = lm_eval.simple_evaluate(
-            model=model,
-            task_manager=task_manager,
-            tasks=['lambada_openai', 'arc_challenge'],
-            batch_size=4,
-            apply_chat_template=False
-        )        
-        self.print(results['results'])
-        self.log('lambada_openai/perplexity', results['results']['lambada_openai']['perplexity,none'], logger=True, sync_dist=True)
-        self.log('lambada_openai/acc', results['results']['lambada_openai']['acc,none'], logger=True, sync_dist=True)
-        self.log('arc/easy', results['results']['arc_challenge']['acc,none'], logger=True, sync_dist=True)
+        if self.global_rank == 0:
+            self.model.device = torch.device(f'cuda:{self.global_rank}')
+            model = HFLM(
+                pretrained=self.model,
+                tokenizer=self.tokenizer,
+                backend='causal',
+                add_bos_token=True
+            )
+            task_manager = TaskManager(
+                metadata={
+                    "max_seq_lengths": [1024, 2048, 4096, 8192],
+                    "tokenizer": self.tokenizer,
+                    "shuffle": True,
+                    "enable_cache": True,
+                    "num_samples": 500,
+                },
+            )
+            results = lm_eval.simple_evaluate(
+                model=model,
+                task_manager=task_manager,
+                tasks=self.eval_tasks,
+                batch_size=4,
+                apply_chat_template=False
+            )        
+            pprint(results['results'], expand_all=True, indent_guides=True)
+            for task_name, result in results['results'].items():
+                if 'acc,none' in result.keys():
+                    self.log(f'{task_name}/acc', result['acc,none'], logger=True)
+                if 'perplexity,none' in result.keys():
+                    self.log(f'{task_name}/perplexity', result['perplexity,none'], logger=True)
         
     def on_save_checkpoint(self, checkpoint):
         pq_idx = torch.tensor([self.pq_idx], device=self.device)        
@@ -180,8 +190,8 @@ class LanguageModel(L.LightningModule):
         )
         warmup_steps = self.optimize_config.warmup_ratio * optimizer_steps
         emb_params = list(self.model.model.emb.parameters())
-        hidden_1d_params = [p for n, p in self.model.model.enc.named_parameters() if p.dim() < 2 or p.dim() == 3]    # 3 for causal convolution parameters
-        hidden_2d_params = [p for n, p in self.model.model.enc.named_parameters() if p.dim() == 2]
+        hidden_1d_params = [p for n, p in self.model.model.layers.named_parameters() if p.dim() < 2 or p.dim() == 3]    # 3 for causal convolution parameters
+        hidden_2d_params = [p for n, p in self.model.model.layers.named_parameters() if p.dim() == 2]
         head_params = list(self.model.lm_head.parameters())
         adam_groups = [
             dict(params=emb_params, lr=10 * peak_lr),

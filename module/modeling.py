@@ -1,28 +1,24 @@
-import random
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from einops import rearrange
-from fla.layers.utils import get_unpad_data, index_first_axis
-from fla.models.delta_net.configuration_delta_net import DeltaNetConfig
-from fla.models.delta_net.modeling_delta_net import DeltaNetBlock
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.modules.mlp import GatedMLP
 from jaxtyping import Float, Int
 
+from .attention import Attention as AttentionBlock
 from .cache_utils import Cache
-from .switcher import CrossSwitcher, apply_rotary_pos_emb
 
 
 @dataclass
 class ModelConfig:
     vocab_size: int = 32000
-    n_layers: int = 24
+    n_layers: int = 16
     dim: int = 1024
     rotary_dim: int = 128
     n_heads: int = 8
+    expand_ratio: int = 4
     rotary_base: int = 10000
 
 @dataclass
@@ -59,7 +55,7 @@ class RotaryEmbedding(nn.Module):
         sin = freqs.sin()
         return cos.to(hidden_state), sin.to(hidden_state)
 
-class SwitcherLayer(nn.Module):
+class Layer(nn.Module):
 
     def __init__(self, layer_idx: int, config: ModelConfig):
         super().__init__()
@@ -71,29 +67,23 @@ class SwitcherLayer(nn.Module):
         self.input_norm = nn.RMSNorm(self.dim)
         self.post_norm = nn.RMSNorm(self.dim)
 
-        self.attn = CrossSwitcher(self.layer_idx, self.dim, self.n_heads)
+        self.attn = AttentionBlock(self.layer_idx, self.dim, self.n_heads)
         self.mlp = GatedMLP(hidden_size=config.dim, hidden_ratio=config.expand_ratio)
 
     def forward(
         self, 
         hidden_states: torch.Tensor, 
-        k_cache: torch.Tensor, 
-        v_cache: torch.Tensor, 
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        force_attn: bool = False,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        layer_cache: Optional[Cache] = None, 
+        attention_mask: Optional[Int[torch.Tensor, 'b t']] = None,
+        past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
     ):
         x = self.input_norm(hidden_states)
-        x, s = self.attn(
+        x, past_key_values = self.attn(
             x, 
-            k_cache=k_cache, 
-            v_cache=v_cache,
             position_embeddings=position_embeddings,
-            force_attn=force_attn,
-            cu_seqlens=cu_seqlens,
-            past_key_values=layer_cache, 
+            attention_mask=attention_mask,
+            past_key_values=past_key_values, 
             use_cache=use_cache
         )
         hidden_states = hidden_states + x
@@ -102,7 +92,7 @@ class SwitcherLayer(nn.Module):
         x = self.mlp(x)
         hidden_states = hidden_states + x
 
-        return hidden_states, layer_cache
+        return hidden_states, past_key_values
         
 class LanguageModel(nn.Module):
 
@@ -112,20 +102,10 @@ class LanguageModel(nn.Module):
         self.config = config
         self.n_layers = config.n_layers
 
-        delta_config = DeltaNetConfig(
-            hidden_size=config.dim,
-            expand_v=1,
-            num_heads=config.n_heads,
-            head_dim=config.dim // config.n_heads,
-            hidden_ratio=config.expand_ratio
-        )
-
         self.rotary_emb = RotaryEmbedding(config)
-
         self.emb = nn.Embedding(config.vocab_size, config.dim)
         self.layers = nn.ModuleList([
-            SwitcherLayer(i, config) if i % config.hybrid_freq == 0 else DeltaNetBlock(config=delta_config, layer_idx=i) 
-            for i in range(self.n_dec_layers)
+            Layer(i, config) for i in range(self.n_layers)
         ])
         self.norm = nn.RMSNorm(config.dim)
 
@@ -138,44 +118,24 @@ class LanguageModel(nn.Module):
         past_key_values: Optional[Cache] = None
     ):
 
-        layer_cache = None
         if use_cache and past_key_values is None:
-            layer_cache = Cache()
-            past_key_values = {
-                'k_cache': None,
-                'v_cache': None,
-                'layer_cache': layer_cache,    # recurrent cache, for rnn state [B, H, d, d] * L and conv state [B, Hd, conv_d] * L 
-            }
+            past_key_values = Cache()
 
         hidden_states = self.emb(input_ids)
-        
-        cu_seqlens = None
-        if attention_mask is not None:
-            input_length = hidden_states.shape[1]
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -input_length:])    # padding is on the left during inference. Disabled in training.
-            # hidden_states: [B, T, d] -> [1, (total_length), d]
-            hidden_states = index_first_axis(rearrange(hidden_states, 'b s ... -> (b s) ...'), indices).unsqueeze(0)
-            
+       
         if position_ids is None:
             # past_seen_tokens = layer_cache.get_sequence_length()   # [NOTE] not really past tokens. used only for training to decide position ids
-            if attention_mask is not None:
-                position_ids = torch.cumsum(attention_mask, dim=1).long() - 1
-                position_ids = index_first_axis(position_ids.flatten().unsqueeze(-1), indices).squeeze(-1).unsqueeze(0)
-            else:
-                position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0).expand_as(input_ids)    # maximum length in the batch
+            position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0).expand_as(input_ids)    # maximum length in the batch
         position_ids = position_ids.to(hidden_states.device)
-
-        attention_mask = None    # only use cu_seqlens instead of attention_mask for varlen inference
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
-            hidden_states, kv_cache = layer(
+            hidden_states, past_key_values = layer(
                 hidden_states, 
                 attention_mask=attention_mask, 
                 position_embeddings=position_embeddings,
-                past_key_values=kv_cache, 
+                past_key_values=past_key_values, 
                 use_cache=use_cache, 
-                cu_seqlens=cu_seqlens
             )
             
         hidden_states = self.norm(hidden_states)
