@@ -68,6 +68,10 @@ def log_config_and_model():
     console.print()
     summary(model)
 
+@rank_zero_only
+def wandb_log_code(wandb_run):
+    wandb_run.log_code("./")
+
 log_config_and_model()
 
 optimize_config = OptimizeConfig(
@@ -111,10 +115,9 @@ checkpoint_callback = cbs.ModelCheckpoint(
 
 if args.log_to_wandb:
     assert args.wandb_project is not None and args.wandb_runname is not None, "project name and run name not specified"
-    import wandb
-    wandb.init(project=args.wandb_project, name=args.wandb_runname)
-    wandb.run.log_code('./')
-    logger = WandbLogger()
+    logger = WandbLogger(project=args.wandb_project, name=args.wandb_runname)
+    wandb_run = logger.experiment
+    wandb_log_code(wandb_run)
 else:
     logger = CSVLogger(save_dir='./logs/', flush_logs_every_n_steps=50)
 
