@@ -246,7 +246,6 @@ class ModelForCausalLM(nn.Module):
 
         # Decode loop
         while past_key_values.get_sequence_length() < target_length:
-            print(past_key_values.get_sequence_length())
             # Apply sampling logic
             if do_sample:
                 # Temperature
