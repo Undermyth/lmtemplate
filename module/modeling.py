@@ -79,20 +79,27 @@ class Layer(nn.Module):
         use_cache: bool = False,
     ):
         x = self.input_norm(hidden_states)
-        x, past_key_values = self.attn(
+        attn_output = self.attn(
             x, 
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             past_key_values=past_key_values, 
             use_cache=use_cache
         )
+
+        aux_loss = None
+        if len(attn_output) == 3:
+            x, _, past_key_values = attn_output
+        else:
+            x, _, past_key_values, aux_loss = attn_output
+
         hidden_states = hidden_states + x
 
         x = self.post_norm(hidden_states)
         x = self.mlp(x)
         hidden_states = hidden_states + x
 
-        return hidden_states, past_key_values
+        return hidden_states, past_key_values, aux_loss
         
 class LanguageModel(nn.Module):
 
@@ -129,18 +136,21 @@ class LanguageModel(nn.Module):
         position_ids = position_ids.to(hidden_states.device)
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        total_aux_loss = None
         for layer in self.layers:
-            hidden_states, past_key_values = layer(
+            hidden_states, past_key_values, aux_loss = layer(
                 hidden_states, 
                 attention_mask=attention_mask, 
                 position_embeddings=position_embeddings,
                 past_key_values=past_key_values, 
                 use_cache=use_cache, 
             )
+            if aux_loss is not None:
+                total_aux_loss = total_aux_loss + aux_loss if total_aux_loss is not None else aux_loss
             
         hidden_states = self.norm(hidden_states)
         # return ModelOutput(last_hidden_state=hidden_states, past_key_values=past_key_values)
-        return hidden_states, past_key_values
+        return hidden_states, past_key_values, total_aux_loss
 
 class ModelForCausalLM(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -169,6 +179,7 @@ class ModelForCausalLM(nn.Module):
         )
         hidden_states = outputs[0]
         past_key_values = outputs[1]
+        aux_loss = outputs[2]
         
         logits = None
         if not self.training:
@@ -182,5 +193,117 @@ class ModelForCausalLM(nn.Module):
         return ModelOutput(
             logits=logits,
             past_key_values=past_key_values,
-            loss=loss
+            loss=loss,
+            aux_loss=aux_loss
         )
+    
+    def generate(
+        self,
+        input_ids: Int[torch.Tensor, 'b t'],
+        attention_mask: Optional[Int[torch.Tensor, 'b t']] = None,
+        max_length: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
+        use_cache: bool = True,
+        past_key_values: Optional[Cache] = None,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        do_sample: bool = False,
+        eos_token_id: int = 2,
+        **kwargs
+    ):
+        # Determine stopping condition
+        if max_new_tokens is None and max_length is None:
+            max_new_tokens = 100
+
+        if max_new_tokens is not None:
+            target_length = input_ids.shape[1] + max_new_tokens
+        else:
+            target_length = max_length
+            max_new_tokens = max_length - input_ids.shape[1]
+
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # Prefill phase
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1).to(device)
+        outputs = self.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            past_key_values=past_key_values
+        )
+        hidden_states = outputs[0]
+        past_key_values = outputs[1]
+
+        # Get logits for next token prediction
+        logits = self.lm_head(hidden_states)
+        next_token_logits = logits[:, -1, :]
+
+        # Initialize generated sequence
+        generated = input_ids
+
+        # Decode loop
+        while past_key_values.get_sequence_length() < target_length:
+            print(past_key_values.get_sequence_length())
+            # Apply sampling logic
+            if do_sample:
+                # Temperature
+                if temperature != 1.0:
+                    next_token_logits = next_token_logits / temperature
+
+                # Top-k
+                if top_k > 0:
+                    kth_vals = torch.kthvalue(next_token_logits, logits.size(-1) - top_k + 1, dim=-1).values
+                    next_token_logits = torch.where(next_token_logits < kth_vals.unsqueeze(-1), torch.full_like(next_token_logits, float('-inf')), next_token_logits)
+
+                # Top-p (nucleus)
+                if top_p < 1.0:
+                    sorted_logits, indices = torch.sort(next_token_logits, descending=True)
+                    probs = torch.softmax(sorted_logits, dim=-1)
+                    cumsum = torch.cumsum(probs, dim=-1)
+                    mask = cumsum > top_p
+                    mask[:, 1:] = mask[:, :-1].clone()
+                    mask[:, 0] = False
+                    sorted_logits = sorted_logits.masked_fill(mask, float('-inf'))
+                    next_token_logits = torch.gather(sorted_logits, dim=-1, index=indices)
+
+                # Sample
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                # Greedy decoding
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+            # Append to sequence
+            generated = torch.cat([generated, next_token], dim=-1)
+
+            # Check EOS
+            if (next_token == eos_token_id).all():
+                break
+
+            # Prepare for next iteration
+            next_token_id = next_token
+            next_position_ids = torch.tensor([past_key_values.get_sequence_length()]).unsqueeze(0).expand(batch_size, -1).to(device)
+
+            # Extend attention mask (all ones since no padding in generation)
+            if attention_mask is not None:
+                attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, device=device, dtype=attention_mask.dtype)], dim=-1)
+
+            # Forward pass with cached states
+            outputs = self.model(
+                input_ids=next_token_id,
+                position_ids=next_position_ids,
+                attention_mask=attention_mask,
+                use_cache=use_cache,
+                past_key_values=past_key_values
+            )
+            hidden_states = outputs[0]
+            past_key_values = outputs[1]
+
+            # Get logits
+            logits = self.lm_head(hidden_states)
+            next_token_logits = logits[:, -1, :]
+
+        return generated

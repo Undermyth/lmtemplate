@@ -85,6 +85,9 @@ class LanguageModel(L.LightningModule):
         self.rg_idx = state_dict['rg_idx']
         output = self.model(input_ids=x, label=y)
         loss = output.loss
+        aux_loss = output.aux_loss
+        if aux_loss is not None:
+            loss = loss + aux_loss
 
         # manual optimization for multiple optimizers
         loss = loss / self.grad_accum
@@ -114,6 +117,8 @@ class LanguageModel(L.LightningModule):
                 sch.step()
 
             self.log('train/loss', self.stream_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
+            if aux_loss is not None:
+                self.log('train/aux_loss', aux_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
             self.stream_loss = 0
         
         # self.log('train/loss', loss.item(), on_step=True, prog_bar=True, logger=True)
@@ -140,7 +145,7 @@ class LanguageModel(L.LightningModule):
                     "tokenizer": self.tokenizer,
                     "shuffle": True,
                     "enable_cache": True,
-                    "num_samples": 500,
+                    "num_samples": 200,
                 },
             )
             results = lm_eval.simple_evaluate(

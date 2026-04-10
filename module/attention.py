@@ -159,5 +159,5 @@ class Attention(nn.Module):
                 offset=q_len
             )
 
-        return o_attn, past_key_values
+        return o_attn, None, past_key_values
 
