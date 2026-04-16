@@ -157,10 +157,15 @@ class LanguageModel(L.LightningModule):
             )        
             pprint(results['results'], expand_all=True, indent_guides=True)
             for task_name, result in results['results'].items():
-                if 'acc,none' in result.keys():
-                    self.log(f'{task_name}/acc', result['acc,none'], logger=True)
-                if 'perplexity,none' in result.keys():
-                    self.log(f'{task_name}/perplexity', result['perplexity,none'], logger=True)
+                if 'niah' in task_name:
+                    for metric_name, metric in result.items():
+                        if metric_name.split(',')[0].isdigit():
+                            self.log(f'{task_name}/{metric_name.split(",")[0]}-acc', metric, logger=True)
+                else:
+                    if 'acc,none' in result.keys():
+                        self.log(f'{task_name}/acc', result['acc,none'], logger=True)
+                    if 'perplexity,none' in result.keys():
+                        self.log(f'{task_name}/perplexity', result['perplexity,none'], logger=True)
         
     def on_save_checkpoint(self, checkpoint):
         pq_idx = torch.tensor([self.pq_idx], device=self.device)        
