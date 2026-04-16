@@ -166,6 +166,7 @@ class LanguageModel(L.LightningModule):
                         self.log(f'{task_name}/acc', result['acc,none'], logger=True)
                     if 'perplexity,none' in result.keys():
                         self.log(f'{task_name}/perplexity', result['perplexity,none'], logger=True)
+        self.trainer.strategy.barrier()
         
     def on_save_checkpoint(self, checkpoint):
         pq_idx = torch.tensor([self.pq_idx], device=self.device)        
