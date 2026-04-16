@@ -209,13 +209,13 @@ class LanguageModel(L.LightningModule):
             dict(params=head_params, lr=0.1 * peak_lr),
             dict(params=hidden_1d_params, lr=peak_lr)
         ]
-        adam_opt = torch.optim.AdamW(adam_groups, betas=(0.8, 0.95), weight_decay=self.optimize_config.weight_decay)
+        adam_opt = torch.optim.AdamW(adam_groups, betas=(0.9, 0.95), weight_decay=self.optimize_config.weight_decay)
         muon_opt = torch.optim.Muon(hidden_2d_params, lr=peak_lr, momentum=0.95, weight_decay=self.optimize_config.weight_decay)
         adam_scheduler = create_warmup_cosine_scheduler(
             optimizer=adam_opt, warmup_epochs=warmup_steps, total_epochs=optimizer_steps, eta_min=self.optimize_config.min_lr_frac * 0.1 * peak_lr
         )
         muon_scheduler = create_warmup_cosine_scheduler(
-            optimizer=muon_opt, warmup_epochs=270, total_epochs=54163, eta_min=self.optimize_config.min_lr_frac * peak_lr
+            optimizer=muon_opt, warmup_epochs=warmup_steps, total_epochs=optimizer_steps, eta_min=self.optimize_config.min_lr_frac * peak_lr
         )
         adam_scheduler_cfg = {
             'scheduler': adam_scheduler,

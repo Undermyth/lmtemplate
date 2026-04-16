@@ -38,10 +38,10 @@ parser.add_argument("--eval-tasks", type=str, default=None, help="Comma-separate
 
 # optimize settings
 parser.add_argument("--optimizer", type=str, default="muon", choices=["adam", "muon"])
-parser.add_argument("--optimize-tokens", type=float, default=20)      # scheduler epoch for n billion tokens
+parser.add_argument("--optimize-tokens", type=float, default=30)      # scheduler epoch for n billion tokens
 parser.add_argument("--lr", type=float, default=0.02)
 parser.add_argument("--min-lr-frac", type=float, default=0.001)
-parser.add_argument("--weight-decay", type=float, default=0.1)
+parser.add_argument("--weight-decay", type=float, default=0.01)
 parser.add_argument("--grad-clip", type=float, default=None)
 parser.add_argument("--warmup-ratio", type=float, default=0.005)
 args = parser.parse_args()
