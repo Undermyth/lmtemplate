@@ -6,6 +6,7 @@ import torch.nn as nn
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.modules.mlp import GatedMLP
 from jaxtyping import Float, Int
+from torch.utils.checkpoint import checkpoint
 
 from .attention import Attention as AttentionBlock
 from .cache_utils import Cache
@@ -14,18 +15,20 @@ from .cache_utils import Cache
 @dataclass
 class ModelConfig:
     vocab_size: int = 32000
-    n_layers: int = 16
+    n_layers: int = 24
     dim: int = 1024
     rotary_dim: int = 128
     n_heads: int = 8
     expand_ratio: int = 4
     rotary_base: int = 10000
+    key_expand: int = 2
 
 @dataclass
 class ModelOutput:
     logits: Optional[torch.Tensor] = None
     past_key_values: Optional[dict] = None
     loss: Optional[torch.Tensor] = None
+    aux_loss: Optional[torch.Tensor] = None
 
 class RotaryEmbedding(nn.Module):
     
@@ -63,11 +66,12 @@ class Layer(nn.Module):
         self.dim = config.dim
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
+        self.rotary_dim = config.rotary_dim
 
         self.input_norm = nn.RMSNorm(self.dim)
         self.post_norm = nn.RMSNorm(self.dim)
 
-        self.attn = AttentionBlock(self.layer_idx, self.dim, self.n_heads)
+        self.attn = AttentionBlock(layer_idx=self.layer_idx, dim=self.dim, n_heads=self.n_heads, rotary_emb_dim=self.rotary_dim)
         self.mlp = GatedMLP(hidden_size=config.dim, hidden_ratio=config.expand_ratio)
 
     def forward(
@@ -93,11 +97,11 @@ class Layer(nn.Module):
         else:
             x, _, past_key_values, aux_loss = attn_output
 
-        hidden_states = hidden_states + x
+        hidden_states = hidden_states + x   # mark attn
 
         x = self.post_norm(hidden_states)
         x = self.mlp(x)
-        hidden_states = hidden_states + x
+        hidden_states = hidden_states + x   # mark mlp
 
         return hidden_states, past_key_values, aux_loss
         
@@ -122,7 +126,8 @@ class LanguageModel(nn.Module):
         position_ids: Optional[Int[torch.Tensor, 'b t']] = None,      # decided by generate(). when decoding, will contain only decoded part
         attention_mask: Optional[Int[torch.Tensor, 'b t']] = None,    # decided by generate(). when decoding, will contain both prefill and generated part
         use_cache: bool = False, 
-        past_key_values: Optional[Cache] = None
+        past_key_values: Optional[Cache] = None,
+        use_gradient_checkpoint: bool = False
     ):
 
         if use_cache and past_key_values is None:
@@ -138,13 +143,24 @@ class LanguageModel(nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         total_aux_loss = None
         for layer in self.layers:
-            hidden_states, past_key_values, aux_loss = layer(
-                hidden_states, 
-                attention_mask=attention_mask, 
-                position_embeddings=position_embeddings,
-                past_key_values=past_key_values, 
-                use_cache=use_cache, 
-            )
+            if use_gradient_checkpoint:
+                hidden_states, past_key_values, aux_loss = checkpoint(
+                    layer,
+                    hidden_states,
+                    attention_mask=attention_mask, 
+                    position_embeddings=position_embeddings,
+                    past_key_values=past_key_values, 
+                    use_cache=use_cache, 
+                    use_reentrant=False
+                )
+            else:
+                hidden_states, past_key_values, aux_loss = layer(
+                    hidden_states, 
+                    attention_mask=attention_mask, 
+                    position_embeddings=position_embeddings,
+                    past_key_values=past_key_values, 
+                    use_cache=use_cache, 
+                )
             if aux_loss is not None:
                 total_aux_loss = total_aux_loss + aux_loss if total_aux_loss is not None else aux_loss
             
@@ -161,6 +177,18 @@ class ModelForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
         self.criteria = FusedLinearCrossEntropyLoss()
 
+    def get_input_embeddings(self):
+        return self.model.emb
+    
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_output_norm(self):
+        return self.model.norm
+
+    def get_decoder(self):
+        return self.model.layers
+
     def forward(
         self, 
         input_ids: Int[torch.Tensor, 'b t'], 
@@ -168,14 +196,16 @@ class ModelForCausalLM(nn.Module):
         attention_mask: Optional[Int[torch.Tensor, 'b t']] = None,    # decided by generate(). when decoding, will contain both prefill and generated part
         label: Optional[Int[torch.Tensor, 'b t']] = None,             # already shifted labels
         use_cache: bool = False, 
-        past_key_values: Optional[Cache] = None
+        past_key_values: Optional[Cache] = None,
+        use_gradient_checkpoint: bool = False
     ):
         outputs = self.model(
             input_ids, 
             position_ids=position_ids,
             attention_mask=attention_mask, 
             use_cache=use_cache, 
-            past_key_values=past_key_values
+            past_key_values=past_key_values,
+            use_gradient_checkpoint=use_gradient_checkpoint
         )
         hidden_states = outputs[0]
         past_key_values = outputs[1]
