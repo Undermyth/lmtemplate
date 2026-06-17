@@ -68,20 +68,38 @@ class StreamingParquet(IterableDataset):
         self.pq_idx = state_dict['pq_idx']
         self.rg_idx = state_dict['rg_idx']
         print(f'[streaming parquet] start loader at pq_idx = {self.pq_idx}, rg_idx = {self.rg_idx}')
+        self.inf_batch_document_iterator = self.document_batches()  # re-create generator with new resume state
                 
     def document_batches(self):
-        # ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
         parquet_paths = list_parquet_files(self.parquet_dir)
         parquet_paths = parquet_paths[:-1] if self.split == "train" else parquet_paths[-1:]
+        if len(parquet_paths) == 0:
+            raise RuntimeError(f'No parquet files found in {self.parquet_dir}')
         resume_pq_idx = self.pq_idx
         resume_rg_idx = self.rg_idx
         pq_idx = resume_pq_idx # we kick off parquet files at the resume index (or by default just 0)
         while True: # iterate infinitely (multi-epoch)
+            # If we've exhausted known files, re-scan for new ones
+            if pq_idx >= len(parquet_paths):
+                current_paths = list_parquet_files(self.parquet_dir)
+                current_paths = current_paths[:-1] if self.split == "train" else current_paths[-1:]
+                # Verify existing files haven't changed (new files only appended at end)
+                if len(current_paths) >= len(parquet_paths) and current_paths[:len(parquet_paths)] == parquet_paths:
+                    new_count = len(current_paths) - len(parquet_paths)
+                    if new_count > 0:
+                        print(f'[streaming parquet] found {new_count} new parquet file(s), extending epoch')
+                    else:
+                        print(f'[streaming parquet] starting new epoch from file 0')
+                        pq_idx = 0
+                    parquet_paths = current_paths
+                else:
+                    print(f'[streaming parquet] WARNING: existing file list changed, restarting from beginning')
+                    parquet_paths = current_paths
+                    pq_idx = 0
             while pq_idx < len(parquet_paths): # iterate over all parquet files
                 filepath = parquet_paths[pq_idx]
                 pf = pq.ParquetFile(filepath)
                 # Start from resume point if resuming on same file, otherwise from DDP rank
-                # I know this state resumption is a little bit tricky and a little bit hacky... sigh.
                 if resume_rg_idx is not None:
                     base_idx = resume_rg_idx // self.world_size # in units of ddp_world_size
                     base_idx += 1 # advance by 1 so that we definitely don't repeat data after resuming
@@ -94,7 +112,6 @@ class StreamingParquet(IterableDataset):
                     batch = rg.column('text').to_pylist() # each batch is a parquet group, e.g. 1024 rows
                     # the tokenizer encode might want to go in even smaller batches, e.g. 128 rows
                     for i in range(0, len(batch), self.tokenizer_batch_size):
-                        # print(pq_idx, rg_idx, i, len(batch))
                         yield batch[i:i+self.tokenizer_batch_size], (pq_idx, rg_idx)
                     rg_idx += self.world_size # advance to the next row group (in DDP)
                 pq_idx += 1 # advance to the next parquet file
@@ -133,9 +150,9 @@ class StreamingParquet(IterableDataset):
 if __name__ == '__main__':
     from transformers import AutoTokenizer
     from torch.utils.data import DataLoader
-    tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b', legacy=False)
+    tokenizer = AutoTokenizer.from_pretrained('/home/csy/tokenizer/llama2-7b/', legacy=False)
     dataset = StreamingParquet(
-        parquet_dir='/data2/csy/transformers/hub/datasets--skymizer--fineweb-edu-dedup-45B/parquets',
+        parquet_dir='/nas/datasets/karpathy--fineweb-edu-100b/',
         batch_size=4,
         seq_len=2048,
         tokenizer=tokenizer
