@@ -35,10 +35,16 @@ parser.add_argument("--checkpoint-tokens", type=float, default=0.5)   # save a c
 parser.add_argument("--eval-per-checkpoint", type=int, default=2)   # evaluate n times in one checkpoint duration
 parser.add_argument("--val-sanity", action="store_true")
 parser.add_argument("--eval-tasks", type=str, default=None, help="Comma-separated list of eval tasks, e.g., arc_challenge,arc_easy,lambada_openai")
+parser.add_argument("--dry-run", action="store_true")
+
+# parallelism settings & infra optimization options
+parser.add_argument("--parallel", type=str, default="ddp", choices=["ddp", "zero1", "zero2"])
+parser.add_argument("--gradient-checkpoint", action="store_true")
+parser.add_argument("--offload-optimizer", action="store_true")
 
 # optimize settings
 parser.add_argument("--optimizer", type=str, default="muon", choices=["adam", "muon"])
-parser.add_argument("--optimize-tokens", type=float, default=30)      # scheduler epoch for n billion tokens
+parser.add_argument("--optimize-tokens", type=float, default=40)      # scheduler epoch for n billion tokens
 parser.add_argument("--lr", type=float, default=0.02)
 parser.add_argument("--min-lr-frac", type=float, default=0.001)
 parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -66,13 +72,11 @@ def log_config_and_model():
 
     console.print(table)
     console.print()
-    summary(model)
+    summary(model.model)
 
 @rank_zero_only
 def wandb_log_code(wandb_run):
     wandb_run.log_code("./")
-
-log_config_and_model()
 
 optimize_config = OptimizeConfig(
     peak_lr=args.lr,
@@ -81,6 +85,9 @@ optimize_config = OptimizeConfig(
     weight_decay=args.weight_decay,
     grad_clip=args.grad_clip
 )
+
+if args.parallel != "ddp" and args.optimizer == "muon" and args.grad_clip is not None:
+    raise RuntimeError("ZeRO with Muon does not support grad_clip currently")
 
 model = LanguageModel(
     model=model,
@@ -93,17 +100,29 @@ model = LanguageModel(
     optimize_tokens=args.optimize_tokens,
     eval_tasks=args.eval_tasks.split(","),
     optimizer=args.optimizer,
-    optimize_config=optimize_config
+    optimize_config=optimize_config,
+    use_gradient_checkpoint=args.gradient_checkpoint,
+    use_parallel=True,
+    use_advanced_parallel=(args.parallel != "ddp")
 )
+
+if args.dry_run:
+    log_config_and_model()
+    print(model)
+    exit()
 
 every_n_train_steps = get_checkpoint_steps(
     n_checkpoint_tokens=args.checkpoint_tokens,
-    n_optimizers=2 if args.optimizer == "muon" else 1,
+    n_optimizers=1,
     n_grad_accum_steps=args.grad_accum_steps,
     n_gpus=args.ngpus,
     micro_batch_size=args.micro_batch_size,
     seq_len=args.seqlen
 )
+
+save_format = '{epoch}-{step}'
+if args.wandb_runname is not None:
+    save_format = args.wandb_runname + '-{step}'
 
 checkpoint_callback = cbs.ModelCheckpoint(
     dirpath=args.checkpoint_dir,
@@ -111,6 +130,7 @@ checkpoint_callback = cbs.ModelCheckpoint(
     save_on_exception=False,
     every_n_train_steps=every_n_train_steps,
     save_top_k=-1,
+    filename=save_format
 )
 
 if args.log_to_wandb:
@@ -121,6 +141,8 @@ if args.log_to_wandb:
 else:
     logger = CSVLogger(save_dir='./logs/', flush_logs_every_n_steps=50)
 
+log_config_and_model()
+
 prog_callback = cbs.TQDMProgressBar()
 
 lr_monitor = cbs.LearningRateMonitor(logging_interval="step")
@@ -128,25 +150,47 @@ lr_monitor = cbs.LearningRateMonitor(logging_interval="step")
 eval_steps = get_eval_steps(
     every_n_train_steps=every_n_train_steps,
     n_eval_per_checkpoint=args.eval_per_checkpoint,
-    n_optimizers=2 if args.optimizer == "muon" else 1,
+    n_optimizers=1,
     n_grad_accum_steps=args.grad_accum_steps,
     n_gpus=args.ngpus,
     micro_batch_size=args.micro_batch_size,
     seq_len=args.seqlen
 )
 
+if args.parallel != "ddp":
+    # load deepspeed basic configuration
+    import json
+
+    from lightning.pytorch.strategies import DeepSpeedStrategy
+    with open('deepspeed.json', 'r') as f:
+        deepspeed_config = json.load(f)
+    
+    # update with cmd args
+    if args.parallel == "zero1":
+        deepspeed_config["zero_optimization"]["stage"] = 1
+    elif args.parallel == "zero2":
+        deepspeed_config["zero_optimization"]["stage"] = 2
+    if not args.offload_optimizer:
+        deepspeed_config["zero_optimization"].pop("offload_optimizer")
+
+    strategy = DeepSpeedStrategy(config=deepspeed_config)    
+else:
+    from lightning.pytorch.strategies import DDPStrategy
+    strategy = DDPStrategy()
+
 trainer = L.Trainer(
     max_epochs=1,
     accelerator="gpu",
     devices=args.ngpus,
-    strategy="ddp",
+    strategy=strategy,
     precision="bf16-mixed",
     callbacks=[checkpoint_callback, prog_callback, lr_monitor],
     logger=logger,
     log_every_n_steps=20, 
     val_check_interval=eval_steps,
     num_sanity_val_steps=-1 if args.val_sanity else 0,
-    # accumulate_grad_batches=8,
+    accumulate_grad_batches=args.grad_accum_steps,
+    gradient_clip_val=args.grad_clip,
     enable_model_summary=True,
 )
 
