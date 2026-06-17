@@ -5,12 +5,15 @@ from typing import List, Literal, Optional
 import lightning as L
 import lm_eval  # type: ignore
 import torch
+from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam as ZeroMuonWithAuxAdam
 from lm_eval.models.huggingface import HFLM  # type: ignore
 from lm_eval.tasks import TaskManager  # type: ignore
 from rich.pretty import pprint
 from torch.utils.data import DataLoader
 
 from data.stream_parquet import StreamingParquet
+from muon import MuonWithAuxAdam as DDPMuonWithAdam
+from muon import SingleDeviceMuonWithAuxAdam
 from train_utils import create_warmup_cosine_scheduler, get_optimizer_steps
 
 
@@ -41,6 +44,9 @@ class LanguageModel(L.LightningModule):
         eval_tasks: List[str],
         optimizer: Literal["adam", "muon"] = "muon",
         optimize_config: OptimizeConfig = OptimizeConfig(),
+        use_gradient_checkpoint: bool = False,
+        use_parallel: bool = True,
+        use_advanced_parallel: bool = False,    # whether parallel like FSDP/ZeRO is used
     ):
         super().__init__()
         self.model = model
@@ -55,12 +61,15 @@ class LanguageModel(L.LightningModule):
         self.optimizer = optimizer
         self.optimize_config = optimize_config
         self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.use_gradient_checkpoint = use_gradient_checkpoint
+        self.use_parallel = use_parallel
+        self.use_advanced_parallel = use_advanced_parallel
 
         # resume training dataset
         self.pq_idx = 0
         self.rg_idx = None
 
-        self.automatic_optimization = False
+        self.automatic_optimization = True
         self.stream_loss = 0
 
     def setup(self, stage=None):
@@ -83,49 +92,24 @@ class LanguageModel(L.LightningModule):
         y = y.squeeze(0)
         self.pq_idx = state_dict['pq_idx']
         self.rg_idx = state_dict['rg_idx']
-        output = self.model(input_ids=x, label=y)
+        output = self.model(input_ids=x, label=y, use_gradient_checkpoint=self.use_gradient_checkpoint)
         loss = output.loss
         aux_loss = output.aux_loss
         if aux_loss is not None:
-            loss = loss + aux_loss
+            loss = loss + 0.1 * aux_loss
 
-        # manual optimization for multiple optimizers
-        loss = loss / self.grad_accum
-        self.stream_loss += loss.item()
-        self.manual_backward(loss)
+        self.stream_loss += loss.item() / self.grad_accum
         if (batch_idx + 1) % self.grad_accum == 0:
-
-            # get optimizers and schdulers
-            opts = self.optimizers()
-            if not isinstance(opts, list):
-                opts = [opts]
-            schs = self.lr_schedulers()
-            if not isinstance(schs, list):
-                schs = [schs]
-
-            # compute grad norm before update
             total_norm = torch.stack([torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]).pow(2).sum().pow(0.5)
             self.log('train/grad_norm', total_norm, on_step=True, prog_bar=False, logger=True, sync_dist=True)
-
-            # optimize and schedule
-            for opt in opts:
-                if self.optimize_config.grad_clip is not None:
-                    self.clip_gradients(opt, gradient_clip_val=self.optimize_config.grad_clip, gradient_clip_algorithm='norm')
-                opt.step()
-                opt.zero_grad()
-            for sch in schs:
-                sch.step()
-
             self.log('train/loss', self.stream_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
             if aux_loss is not None:
                 self.log('train/aux_loss', aux_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
             self.stream_loss = 0
         
-        # self.log('train/loss', loss.item(), on_step=True, prog_bar=True, logger=True)
         self.log('train/pq_idx', self.pq_idx.item(), on_step=True, prog_bar=True, logger=False)
         self.log('train/rg_idx', self.rg_idx.item(), on_step=True, prog_bar=True, logger=False)
         return loss
-   
 
     def validation_step(self, batch, idx):
         pass
@@ -137,15 +121,16 @@ class LanguageModel(L.LightningModule):
                 pretrained=self.model,
                 tokenizer=self.tokenizer,
                 backend='causal',
-                add_bos_token=True
+                add_bos_token=True,
+                max_length=16384,
             )
             task_manager = TaskManager(
                 metadata={
-                    "max_seq_lengths": [1024, 2048, 4096, 8192],
+                    "max_seq_lengths": [1024, 2048, 4096],
                     "tokenizer": self.tokenizer,
                     "shuffle": True,
                     "enable_cache": True,
-                    "num_samples": 200,
+                    "num_samples": 100,
                 },
             )
             results = lm_eval.simple_evaluate(
@@ -167,6 +152,7 @@ class LanguageModel(L.LightningModule):
                     if 'perplexity,none' in result.keys():
                         self.log(f'{task_name}/perplexity', result['perplexity,none'], logger=True)
         self.trainer.strategy.barrier()
+                
         
     def on_save_checkpoint(self, checkpoint):
         pq_idx = torch.tensor([self.pq_idx], device=self.device)        
@@ -189,8 +175,8 @@ class LanguageModel(L.LightningModule):
     def tune_optimizer(self, state_dict):
         state_dict['lr_schedulers'][0]['_schedulers'][1]['T_max'] = 53893
         state_dict['lr_schedulers'][1]['_schedulers'][1]['T_max'] = 53893
-
-    def build_muon_optimizers(self):
+    
+    def build_muon_optimizers(self, distributed: bool = True, use_zero: bool = False):    # use deepspeed ZeRO Muon optimizer. Only support single scheduler
         peak_lr = self.optimize_config.peak_lr
         optimizer_steps = get_optimizer_steps(
             n_optimize_tokens=self.optimize_tokens,
@@ -200,34 +186,29 @@ class LanguageModel(L.LightningModule):
             seq_len=self.seq_len
         )
         warmup_steps = self.optimize_config.warmup_ratio * optimizer_steps
-        emb_params = list(self.model.model.emb.parameters())
-        hidden_1d_params = [p for n, p in self.model.model.layers.named_parameters() if p.dim() < 2 or p.dim() == 3]    # 3 for causal convolution parameters
-        hidden_2d_params = [p for n, p in self.model.model.layers.named_parameters() if p.dim() == 2]
-        head_params = list(self.model.lm_head.parameters())
+        emb_params = list(self.model.get_input_embeddings().parameters())
+        hidden_1d_params = [p for n, p in self.model.get_decoder().named_parameters() if p.dim() < 2 or p.dim() == 3]    # 3 for causal convolution parameters
+        hidden_1d_params = hidden_1d_params + [p for n, p in self.model.get_output_norm().named_parameters()]
+        hidden_2d_params = [p for n, p in self.model.get_decoder().named_parameters() if p.dim() == 2]
+        for p in hidden_2d_params:
+            p.use_muon = True
+        head_params = list(self.model.get_output_embeddings().parameters())
         adam_groups = [
             dict(params=emb_params, lr=10 * peak_lr),
             dict(params=head_params, lr=0.1 * peak_lr),
             dict(params=hidden_1d_params, lr=peak_lr)
         ]
-        adam_opt = torch.optim.AdamW(adam_groups, betas=(0.9, 0.95), weight_decay=self.optimize_config.weight_decay)
-        muon_opt = torch.optim.Muon(hidden_2d_params, lr=peak_lr, momentum=0.95, weight_decay=self.optimize_config.weight_decay)
-        adam_scheduler = create_warmup_cosine_scheduler(
-            optimizer=adam_opt, warmup_epochs=warmup_steps, total_epochs=optimizer_steps, eta_min=self.optimize_config.min_lr_frac * 0.1 * peak_lr
+        adam_groups = [dict(**g, betas=(0.9, 0.95), use_muon=False, weight_decay=self.optimize_config.weight_decay) for g in adam_groups]
+        muon_group = dict(params=hidden_2d_params, lr=peak_lr, momentum=0.95, use_muon=True, weight_decay=self.optimize_config.weight_decay)
+        param_groups = [*adam_groups, muon_group]
+        Muon = SingleDeviceMuonWithAuxAdam 
+        if distributed:
+            Muon = ZeroMuonWithAuxAdam if use_zero else DDPMuonWithAdam
+        optimizer = Muon(param_groups)
+        scheduler = create_warmup_cosine_scheduler(
+            optimizer=optimizer, warmup_epochs=warmup_steps, total_epochs=optimizer_steps, eta_min=self.optimize_config.min_lr_frac * peak_lr
         )
-        muon_scheduler = create_warmup_cosine_scheduler(
-            optimizer=muon_opt, warmup_epochs=warmup_steps, total_epochs=optimizer_steps, eta_min=self.optimize_config.min_lr_frac * peak_lr
-        )
-        adam_scheduler_cfg = {
-            'scheduler': adam_scheduler,
-            'interval': "step",
-            'frequency': 1
-        }
-        muon_scheduler_cfg = {
-            'scheduler': muon_scheduler,
-            'interval': "step",
-            'frequency': 1
-        }
-        return [adam_opt, muon_opt], [adam_scheduler_cfg, muon_scheduler_cfg]
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1}}
 
     def build_adam_optimizers(self):
         peak_lr = self.optimize_config.peak_lr
@@ -239,7 +220,19 @@ class LanguageModel(L.LightningModule):
             seq_len=self.seq_len
         )
         warmup_steps = self.optimize_config.warmup_ratio * optimizer_steps
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=peak_lr, betas=(0.9, 0.95), weight_decay=self.optimize_config.weight_decay)
+        emb_params = list(self.model.get_input_embeddings().parameters())
+        hidden_1d_params = [p for n, p in self.model.get_decoder().named_parameters() if p.dim() < 2 or p.dim() == 3]    # 3 for causal convolution parameters
+        hidden_1d_params = hidden_1d_params + [p for n, p in self.model.get_output_norm().named_parameters()]
+        hidden_2d_params = [p for n, p in self.model.get_decoder().named_parameters() if p.dim() == 2]
+        head_params = list(self.model.get_output_embeddings().parameters())
+        groups = [
+            dict(params=emb_params, lr=peak_lr, weight_decay=self.optimize_config.weight_decay),
+            dict(params=head_params, lr=peak_lr, weight_decay=self.optimize_config.weight_decay),
+            dict(params=hidden_2d_params, lr=peak_lr, weight_decay=self.optimize_config.weight_decay),
+            dict(params=hidden_1d_params, lr=peak_lr, weight_decay=0.0)
+        ]
+        param_groups = [dict(**g, betas=(0.9, 0.95)) for g in groups]
+        optimizer = torch.optim.AdamW(param_groups)
         scheduler = create_warmup_cosine_scheduler(
             optimizer=optimizer, warmup_epochs=warmup_steps, total_epochs=optimizer_steps, eta_min=self.optimize_config.min_lr_frac * peak_lr
         )
@@ -247,7 +240,7 @@ class LanguageModel(L.LightningModule):
         
     def configure_optimizers(self):
         if self.optimizer == "muon":
-            return self.build_muon_optimizers()
+            return self.build_muon_optimizers(distributed=self.use_parallel, use_zero=self.use_advanced_parallel)
         elif self.optimizer == "adam":
             return self.build_adam_optimizers()
         
