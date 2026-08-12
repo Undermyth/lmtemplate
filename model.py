@@ -1,5 +1,4 @@
 
-from dataclasses import dataclass
 from typing import List, Literal, Optional
 
 import lightning as L
@@ -12,18 +11,16 @@ from rich.pretty import pprint
 from torch.utils.data import DataLoader
 
 from data.stream_parquet import StreamingParquet
+from module.modeling import ModelForCausalLM 
 from muon import MuonWithAuxAdam as DDPMuonWithAdam
 from muon import SingleDeviceMuonWithAuxAdam
+from optim_utils import (
+    OptimizerConfig,
+    build_param_groups,
+    validate_param_coverage,
+)
 from train_utils import create_warmup_cosine_scheduler, get_optimizer_steps
 
-
-@dataclass
-class OptimizeConfig:
-    peak_lr: float = 0.02
-    warmup_ratio: float = 0.005
-    min_lr_frac: float = 0.01
-    weight_decay: float = 0.1
-    grad_clip: Optional[float] = None
 
 # recommended optimize config for AdamW:
 # peak_lr = 3e-4
@@ -33,7 +30,7 @@ class OptimizeConfig:
 class LanguageModel(L.LightningModule):
     def __init__(
         self, 
-        model, 
+        model: ModelForCausalLM, 
         tokenizer, 
         parquet_path: str, 
         seq_len: int, 
@@ -43,7 +40,7 @@ class LanguageModel(L.LightningModule):
         optimize_tokens: int,
         eval_tasks: List[str],
         optimizer: Literal["adam", "muon"] = "muon",
-        optimize_config: OptimizeConfig = OptimizeConfig(),
+        optimize_config: OptimizerConfig = None,
         use_gradient_checkpoint: bool = False,
         use_parallel: bool = True,
         use_advanced_parallel: bool = False,    # whether parallel like FSDP/ZeRO is used
@@ -59,7 +56,7 @@ class LanguageModel(L.LightningModule):
         self.optimize_tokens = optimize_tokens
         self.eval_tasks = eval_tasks
         self.optimizer = optimizer
-        self.optimize_config = optimize_config
+        self.optimize_config = optimize_config if optimize_config is not None else OptimizerConfig()
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.use_gradient_checkpoint = use_gradient_checkpoint
         self.use_parallel = use_parallel
@@ -186,21 +183,16 @@ class LanguageModel(L.LightningModule):
             seq_len=self.seq_len
         )
         warmup_steps = self.optimize_config.warmup_ratio * optimizer_steps
-        emb_params = list(self.model.get_input_embeddings().parameters())
-        hidden_1d_params = [p for n, p in self.model.get_decoder().named_parameters() if p.dim() < 2 or p.dim() == 3]    # 3 for causal convolution parameters
-        hidden_1d_params = hidden_1d_params + [p for n, p in self.model.get_output_norm().named_parameters()]
-        hidden_2d_params = [p for n, p in self.model.get_decoder().named_parameters() if p.dim() == 2]
-        for p in hidden_2d_params:
-            p.use_muon = True
-        head_params = list(self.model.get_output_embeddings().parameters())
-        adam_groups = [
-            dict(params=emb_params, lr=10 * peak_lr),
-            dict(params=head_params, lr=0.1 * peak_lr),
-            dict(params=hidden_1d_params, lr=peak_lr)
-        ]
-        adam_groups = [dict(**g, betas=(0.9, 0.95), use_muon=False, weight_decay=self.optimize_config.weight_decay) for g in adam_groups]
-        muon_group = dict(params=hidden_2d_params, lr=peak_lr, momentum=0.95, use_muon=True, weight_decay=self.optimize_config.weight_decay)
-        param_groups = [*adam_groups, muon_group]
+
+        param_groups, uncovered = build_param_groups(
+            model=self.model,
+            specs=self.optimize_config.param_groups,
+            peak_lr=peak_lr,
+            global_weight_decay=self.optimize_config.weight_decay,
+            optimizer_type="muon",
+        )
+        validate_param_coverage(self.model, param_groups, uncovered)
+
         Muon = SingleDeviceMuonWithAuxAdam 
         if distributed:
             Muon = ZeroMuonWithAuxAdam if use_zero else DDPMuonWithAdam
@@ -220,18 +212,16 @@ class LanguageModel(L.LightningModule):
             seq_len=self.seq_len
         )
         warmup_steps = self.optimize_config.warmup_ratio * optimizer_steps
-        emb_params = list(self.model.get_input_embeddings().parameters())
-        hidden_1d_params = [p for n, p in self.model.get_decoder().named_parameters() if p.dim() < 2 or p.dim() == 3]    # 3 for causal convolution parameters
-        hidden_1d_params = hidden_1d_params + [p for n, p in self.model.get_output_norm().named_parameters()]
-        hidden_2d_params = [p for n, p in self.model.get_decoder().named_parameters() if p.dim() == 2]
-        head_params = list(self.model.get_output_embeddings().parameters())
-        groups = [
-            dict(params=emb_params, lr=peak_lr, weight_decay=self.optimize_config.weight_decay),
-            dict(params=head_params, lr=peak_lr, weight_decay=self.optimize_config.weight_decay),
-            dict(params=hidden_2d_params, lr=peak_lr, weight_decay=self.optimize_config.weight_decay),
-            dict(params=hidden_1d_params, lr=peak_lr, weight_decay=0.0)
-        ]
-        param_groups = [dict(**g, betas=(0.9, 0.95)) for g in groups]
+
+        param_groups, uncovered = build_param_groups(
+            model=self.model,
+            specs=self.optimize_config.param_groups,
+            peak_lr=peak_lr,
+            global_weight_decay=self.optimize_config.weight_decay,
+            optimizer_type="adam",
+        )
+        validate_param_coverage(self.model, param_groups, uncovered)
+
         optimizer = torch.optim.AdamW(param_groups)
         scheduler = create_warmup_cosine_scheduler(
             optimizer=optimizer, warmup_epochs=warmup_steps, total_epochs=optimizer_steps, eta_min=self.optimize_config.min_lr_frac * peak_lr
