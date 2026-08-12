@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -10,6 +11,9 @@ from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 
 from .cache_utils import Cache
 
+@dataclass
+class FlashAttentionConfig:
+    _attn_implementation: str = 'flash_attention_2'
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -18,10 +22,10 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(
-    x: Float[torch.Tensor, 'b h t d'], 
-    cos: Float[torch.Tensor, 'b t rd'], 
-    sin: Float[torch.Tensor, 'b t rd'], 
-    position_ids=None, 
+    x: Float[torch.Tensor, 'b h t d'],
+    cos: Float[torch.Tensor, 'b t rd'],
+    sin: Float[torch.Tensor, 'b t rd'],
+    position_ids=None,
     unsqueeze_dim: int = 1
 ) -> torch.Tensor:
     """
@@ -88,8 +92,8 @@ class Attention(nn.Module):
         )
 
         self.v_conv1d = ShortConvolution(
-            hidden_size=self.dim, 
-            kernel_size=4, 
+            hidden_size=self.dim,
+            kernel_size=4,
             activation="silu"
         )
 
@@ -97,6 +101,7 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-5)
 
         self.is_causal = True   # used by flash attention
+        self.config = FlashAttentionConfig()    # used by flash attention
 
     def forward(
         self,
@@ -110,7 +115,7 @@ class Attention(nn.Module):
 
         if use_cache:
             assert past_key_values is not None
-        
+
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             past_state = past_key_values[self.layer_idx]
             q_conv_state, k_conv_state, v_conv_state = past_state['conv_state']
@@ -150,7 +155,7 @@ class Attention(nn.Module):
         if key_state is not None and value_state is not None:
             k = torch.cat([key_state, k], dim=-2)
             v = torch.cat([value_state, v], dim=-2)
-        
+
         attention_interface = ALL_ATTENTION_FUNCTIONS['flash_attention_2']
         attn_output, _ = attention_interface(       # q, k, v in [B, H, T, d], but attn_output in [B, T, H, d]
             self,
@@ -173,4 +178,3 @@ class Attention(nn.Module):
             )
 
         return o_attn, None, past_key_values    # keep compatible for fla; reserved position for output_attention
-
