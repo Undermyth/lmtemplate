@@ -11,9 +11,11 @@ from rich.console import Console
 from rich.table import Table
 from torchinfo import summary
 from transformers import AutoTokenizer
+import datetime
 
-from model import LanguageModel, OptimizeConfig
+from model import LanguageModel
 from module.modeling import ModelConfig, ModelForCausalLM
+from optim_utils import load_optimizer_config
 from train_utils import get_checkpoint_steps, get_eval_steps
 
 torch.set_float32_matmul_precision('medium')
@@ -43,13 +45,17 @@ parser.add_argument("--gradient-checkpoint", action="store_true")
 parser.add_argument("--offload-optimizer", action="store_true")
 
 # optimize settings
+parser.add_argument("--optimizer-config", type=str, default="optimizer.yaml",
+                    help="YAML config file for optimizer hyperparams and param groups")
 parser.add_argument("--optimizer", type=str, default="muon", choices=["adam", "muon"])
 parser.add_argument("--optimize-tokens", type=float, default=40)      # scheduler epoch for n billion tokens
-parser.add_argument("--lr", type=float, default=0.02)
-parser.add_argument("--min-lr-frac", type=float, default=0.001)
-parser.add_argument("--weight-decay", type=float, default=0.01)
-parser.add_argument("--grad-clip", type=float, default=None)
-parser.add_argument("--warmup-ratio", type=float, default=0.005)
+# The following args override corresponding values in the YAML config.
+# Leave as None to use the YAML value.
+parser.add_argument("--lr", type=float, default=None, help="Override peak_lr in YAML")
+parser.add_argument("--min-lr-frac", type=float, default=None, help="Override min_lr_frac in YAML")
+parser.add_argument("--weight-decay", type=float, default=None, help="Override weight_decay in YAML")
+parser.add_argument("--grad-clip", type=float, default=None, help="Override grad_clip in YAML")
+parser.add_argument("--warmup-ratio", type=float, default=None, help="Override warmup_ratio in YAML")
 args = parser.parse_args()
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, legacy=False)
@@ -78,15 +84,105 @@ def log_config_and_model():
 def wandb_log_code(wandb_run):
     wandb_run.log_code("./")
 
-optimize_config = OptimizeConfig(
-    peak_lr=args.lr,
-    warmup_ratio=args.warmup_ratio,
-    min_lr_frac=args.min_lr_frac,
-    weight_decay=args.weight_decay,
-    grad_clip=args.grad_clip
-)
 
-if args.parallel != "ddp" and args.optimizer == "muon" and args.grad_clip is not None:
+def describe_group_match(spec) -> str:
+    """Human-readable description of a param group's matching rule."""
+    if spec.source is not None:
+        return f'source: "{spec.source}"'
+    lines = []
+    for s in spec.sources:
+        parts = [f"attr={s.attr!r}"]
+        if s.dim:
+            parts.append(f"dim={s.dim!r}")
+        if s.name:
+            parts.append(f"name~{s.name!r}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+@rank_zero_only
+def log_optimizer_config(optimize_config, wandb_run=None):
+    """Pretty-print the loaded optimizer config as rich tables and, when a
+    wandb run is active, capture it in ``run.config`` for the dashboard."""
+    console = Console()
+
+    # --- Global hyperparameters ---
+    table = Table(title="Optimizer Configuration (Global)", title_style="bold cyan")
+    table.add_column("Hyperparameter", style="cyan", no_wrap=True)
+    table.add_column("Value", style="magenta")
+
+    rows = [
+        ("optimizer_type", args.optimizer),
+        ("peak_lr", optimize_config.peak_lr),
+        ("warmup_ratio", optimize_config.warmup_ratio),
+        ("min_lr_frac", optimize_config.min_lr_frac),
+        ("weight_decay", optimize_config.weight_decay),
+        ("grad_clip", optimize_config.grad_clip),
+    ]
+    for key, val in rows:
+        display = "None (disabled)" if val is None else str(val)
+        table.add_row(key, display)
+    console.print(table)
+    console.print()
+
+    # --- Parameter groups ---
+    groups = Table(title="Optimizer Parameter Groups", title_style="bold cyan")
+    groups.add_column("Group", style="cyan", no_wrap=True)
+    groups.add_column("Match Rule", style="green")
+    groups.add_column("lr_mult", justify="right")
+    groups.add_column("Effective LR", justify="right")
+    groups.add_column("weight_decay", justify="right")
+    groups.add_column("betas")
+    groups.add_column("use_muon")
+    groups.add_column("muon_momentum", justify="right")
+
+    for g in optimize_config.param_groups:
+        eff_lr = optimize_config.peak_lr * g.lr_mult
+        wd = g.weight_decay if g.weight_decay is not None else optimize_config.weight_decay
+        if g.use_muon:
+            betas = "—"
+            momentum = f"{g.muon_momentum:g}"
+            use_muon = "yes"
+        else:
+            betas = f"({g.betas[0]:g}, {g.betas[1]:g})"
+            momentum = "—"
+            use_muon = "no"
+        groups.add_row(
+            g.name,
+            describe_group_match(g),
+            f"{g.lr_mult:g}",
+            f"{eff_lr:.3e}",
+            str(wd),
+            betas,
+            use_muon,
+            momentum,
+        )
+    console.print(groups)
+    console.print()
+
+    # --- wandb capture ---
+    if wandb_run is not None:
+        wandb_run.config.update(
+            {"optimizer": {"type": args.optimizer, **optimize_config.to_dict()}},
+            allow_val_change=True,
+        )
+
+
+optimize_config = load_optimizer_config(args.optimizer_config)
+
+# CLI overrides for YAML values
+if args.lr is not None:
+    optimize_config.peak_lr = args.lr
+if args.min_lr_frac is not None:
+    optimize_config.min_lr_frac = args.min_lr_frac
+if args.weight_decay is not None:
+    optimize_config.weight_decay = args.weight_decay
+if args.grad_clip is not None:
+    optimize_config.grad_clip = args.grad_clip
+if args.warmup_ratio is not None:
+    optimize_config.warmup_ratio = args.warmup_ratio
+
+if args.parallel != "ddp" and args.optimizer == "muon" and optimize_config.grad_clip is not None:
     raise RuntimeError("ZeRO with Muon does not support grad_clip currently")
 
 model = LanguageModel(
@@ -108,6 +204,7 @@ model = LanguageModel(
 
 if args.dry_run:
     log_config_and_model()
+    log_optimizer_config(optimize_config)
     print(model)
     exit()
 
@@ -133,6 +230,7 @@ checkpoint_callback = cbs.ModelCheckpoint(
     filename=save_format
 )
 
+wandb_run = None
 if args.log_to_wandb:
     assert args.wandb_project is not None and args.wandb_runname is not None, "project name and run name not specified"
     logger = WandbLogger(project=args.wandb_project, name=args.wandb_runname)
@@ -142,6 +240,7 @@ else:
     logger = CSVLogger(save_dir='./logs/', flush_logs_every_n_steps=50)
 
 log_config_and_model()
+log_optimizer_config(optimize_config, wandb_run=wandb_run)
 
 prog_callback = cbs.TQDMProgressBar()
 
@@ -173,10 +272,10 @@ if args.parallel != "ddp":
     if not args.offload_optimizer:
         deepspeed_config["zero_optimization"].pop("offload_optimizer")
 
-    strategy = DeepSpeedStrategy(config=deepspeed_config)    
+    strategy = DeepSpeedStrategy(config=deepspeed_config, timeout=datetime.timedelta(hours=2))    
 else:
     from lightning.pytorch.strategies import DDPStrategy
-    strategy = DDPStrategy()
+    strategy = DDPStrategy(timeout=datetime.timedelta(hours=2))
 
 trainer = L.Trainer(
     max_epochs=1,
@@ -190,7 +289,7 @@ trainer = L.Trainer(
     val_check_interval=eval_steps,
     num_sanity_val_steps=-1 if args.val_sanity else 0,
     accumulate_grad_batches=args.grad_accum_steps,
-    gradient_clip_val=args.grad_clip,
+    gradient_clip_val=optimize_config.grad_clip,
     enable_model_summary=True,
 )
 
