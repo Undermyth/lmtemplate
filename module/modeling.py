@@ -9,6 +9,7 @@ from jaxtyping import Float, Int
 from torch.utils.checkpoint import checkpoint
 
 from .attention import Attention as AttentionBlock
+from fla.layers.gated_deltanet import GatedDeltaNet
 from .cache_utils import Cache
 
 
@@ -71,7 +72,14 @@ class Layer(nn.Module):
         self.input_norm = nn.RMSNorm(self.dim)
         self.post_norm = nn.RMSNorm(self.dim)
 
-        self.attn = AttentionBlock(layer_idx=self.layer_idx, dim=self.dim, n_heads=self.n_heads, rotary_emb_dim=self.rotary_dim)
+        # self.attn = AttentionBlock(layer_idx=self.layer_idx, dim=self.dim, n_heads=self.n_heads, rotary_emb_dim=self.rotary_dim)
+        self.attn = GatedDeltaNet(
+            hidden_size=self.dim,
+            expand_v=1,
+            head_dim=self.head_dim,
+            num_heads=self.n_heads,
+            layer_idx=self.layer_idx
+        )
         self.mlp = GatedMLP(hidden_size=config.dim, hidden_ratio=config.expand_ratio)
 
     def forward(
