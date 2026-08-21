@@ -85,6 +85,34 @@ This template supports the **Muon** optimizer (Mish et al., 2024) for training. 
 
 Checkpoints are saved every `--checkpoint-tokens` billion tokens. Evaluation runs `--eval-per-checkpoint` times within each checkpoint interval.
 
+#### Resume from a specific checkpoint
+
+Pass the explicit checkpoint path to `--resume-checkpoint`:
+
+```bash
+python train.py ... \
+    --resume-checkpoint /path/to/checkpoints/0-1000.ckpt
+```
+
+- **DDP 模式**的检查点是单个 `.ckpt` 文件，直接传文件路径；
+- **DeepSpeed（`--parallel zero1/zero2`）模式**的检查点是一个目录（包含 `checkpoint/` 分片子目录），传目录路径。
+
+#### Auto-resume to the latest checkpoint
+
+用保留字 `latest` 让脚本自动扫描 `--checkpoint-dir`，找到其中**最新**的检查点并继续训练
+（同时兼容 DDP 的单文件 `.ckpt` 与 DeepSpeed 的目录型检查点）：
+
+```bash
+python train.py ... \
+    --checkpoint-dir ./checkpoints \
+    --resume-checkpoint latest
+```
+
+- 目录为空或不存在时自动回退为**从头训练**（等价于不传 `--resume-checkpoint`），并打印提示；
+- 按写入时间（mtime）判断新旧，目录型检查点取其内部最新分片文件的时间；
+- 写入中的临时文件/目录（`.`、`tmp` 前缀）会被忽略，避免选中未写完的检查点；
+- 解析出的实际路径会打印在启动日志中，并体现在配置表中。
+
 ---
 
 ## NaN 检测与临界点保存 (NanTrap)

@@ -18,7 +18,7 @@ from model import LanguageModel
 from module.modeling import ModelConfig, ModelForCausalLM
 from nan_tracer import NanTrapTriggered
 from optim_utils import load_optimizer_config
-from train_utils import get_checkpoint_steps, get_eval_steps
+from train_utils import get_checkpoint_steps, get_eval_steps, resolve_resume_checkpoint
 
 torch.set_float32_matmul_precision('medium')
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -64,6 +64,10 @@ parser.add_argument("--weight-decay", type=float, default=None, help="Override w
 parser.add_argument("--grad-clip", type=float, default=None, help="Override grad_clip in YAML")
 parser.add_argument("--warmup-ratio", type=float, default=None, help="Override warmup_ratio in YAML")
 args = parser.parse_args()
+
+# --resume-checkpoint latest: 自动选择 --checkpoint-dir 下最新的检查点续训；
+# 目录为空或不存在时回退为从头训练。解析后的实际路径会体现在配置表中。
+args.resume_checkpoint = resolve_resume_checkpoint(args.resume_checkpoint, args.checkpoint_dir)
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, legacy=False)
 
