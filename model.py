@@ -14,6 +14,7 @@ from data.stream_parquet import StreamingParquet
 from module.modeling import ModelForCausalLM 
 from muon import MuonWithAuxAdam as DDPMuonWithAdam
 from muon import SingleDeviceMuonWithAuxAdam
+from nan_tracer import NanTrapMixin
 from optim_utils import (
     OptimizerConfig,
     build_param_groups,
@@ -27,7 +28,7 @@ from train_utils import create_warmup_cosine_scheduler, get_optimizer_steps
 # weight_decay = 1e-3
 
 
-class LanguageModel(L.LightningModule):
+class LanguageModel(NanTrapMixin, L.LightningModule):
     def __init__(
         self, 
         model: ModelForCausalLM, 
@@ -44,6 +45,8 @@ class LanguageModel(L.LightningModule):
         use_gradient_checkpoint: bool = False,
         use_parallel: bool = True,
         use_advanced_parallel: bool = False,    # whether parallel like FSDP/ZeRO is used
+        nan_dump_dir: Optional[str] = None,     # NaN 临界点 dump 目录；None 表示禁用 NanTrap
+        nan_dump_optimizer: bool = False,       # dump 时是否一并保存优化器状态（体积大）
     ):
         super().__init__()
         self.model = model
@@ -68,6 +71,12 @@ class LanguageModel(L.LightningModule):
 
         self.automatic_optimization = True
         self.stream_loss = 0
+
+        # NanTrap: 首次 NaN/Inf 临界点捕捉（不传 nan_dump_dir 时全部为 no-op）
+        self._nan_dir = nan_dump_dir
+        self._nan_dump_optimizer = nan_dump_optimizer
+        self._nan_window = []
+        self._nan_last_state = {}
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
@@ -95,6 +104,10 @@ class LanguageModel(L.LightningModule):
         if aux_loss is not None:
             loss = loss + 0.1 * aux_loss
 
+        # NanTrap 检测点 1: forward 之后、backward/step 之前检查 loss（含 aux）
+        self._nan_track_sample(x, y, batch_idx, state_dict)
+        self._nan_trap("loss", loss=loss, aux=aux_loss)
+
         self.stream_loss += loss.item() / self.grad_accum
         if (batch_idx + 1) % self.grad_accum == 0:
             total_norm = torch.stack([torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]).pow(2).sum().pow(0.5)
@@ -107,6 +120,20 @@ class LanguageModel(L.LightningModule):
         self.log('train/pq_idx', self.pq_idx.item(), on_step=True, prog_bar=True, logger=False)
         self.log('train/rg_idx', self.rg_idx.item(), on_step=True, prog_bar=True, logger=False)
         return loss
+
+    def backward(self, loss, *args, **kwargs):
+        loss.backward(*args, **kwargs)
+        # NanTrap 检测点 2: backward 之后、grad clip / step 之前检查梯度
+        self._nan_trap("grad")
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        # 必须始终传入 closure：梯度裁剪和 on_before_optimizer_step hook
+        # 都在 _after_closure（即 closure 内部）执行，省略 closure 会导致 grad clip 失效。
+        optimizer.step(closure=optimizer_closure)
+        # NanTrap 检测点 3（兜底）: step 之后检查权重是否被优化器污染
+        self._nan_trap("weight")
+        if self._nan_dir:
+            self._nan_window.clear()
 
     def validation_step(self, batch, idx):
         pass

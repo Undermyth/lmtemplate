@@ -221,3 +221,7 @@ logs/
 wandb/
 lightning_logs/
 .vscode/
+
+# NanTrap NaN dumps
+nan_dump/
+nan_dump

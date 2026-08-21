@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 import lightning as L
 import lightning.pytorch.callbacks as cbs
@@ -15,6 +16,7 @@ import datetime
 
 from model import LanguageModel
 from module.modeling import ModelConfig, ModelForCausalLM
+from nan_tracer import NanTrapTriggered
 from optim_utils import load_optimizer_config
 from train_utils import get_checkpoint_steps, get_eval_steps
 
@@ -38,6 +40,11 @@ parser.add_argument("--eval-per-checkpoint", type=int, default=2)   # evaluate n
 parser.add_argument("--val-sanity", action="store_true")
 parser.add_argument("--eval-tasks", type=str, default=None, help="Comma-separated list of eval tasks, e.g., arc_challenge,arc_easy,lambada_openai")
 parser.add_argument("--dry-run", action="store_true")
+parser.add_argument("--nan-dump-dir", type=str, default=None,
+                    help="NaN 临界点 dump 目录。设置后 NanTrap 会捕捉首次非有限 loss/梯度/权重，"
+                         "保存 (模型权重 + 窗口样本 + RNG + 元信息) 并中止训练，供 reproduce_nan.py 复现。")
+parser.add_argument("--nan-dump-optimizer", action="store_true",
+                    help="NaN dump 时一并保存优化器状态（体积可能数 GB，一般不需要）")
 
 # parallelism settings & infra optimization options
 parser.add_argument("--parallel", type=str, default="ddp", choices=["ddp", "zero1", "zero2"])
@@ -199,7 +206,9 @@ model = LanguageModel(
     optimize_config=optimize_config,
     use_gradient_checkpoint=args.gradient_checkpoint,
     use_parallel=True,
-    use_advanced_parallel=(args.parallel != "ddp")
+    use_advanced_parallel=(args.parallel != "ddp"),
+    nan_dump_dir=args.nan_dump_dir,
+    nan_dump_optimizer=args.nan_dump_optimizer,
 )
 
 if args.dry_run:
@@ -293,7 +302,14 @@ trainer = L.Trainer(
     enable_model_summary=True,
 )
 
-trainer.fit(
-    model=model,
-    ckpt_path=args.resume_checkpoint
-)
+try:
+    trainer.fit(
+        model=model,
+        ckpt_path=args.resume_checkpoint
+    )
+except NanTrapTriggered as e:
+    print(f"\n[NanTrap] 训练因 NaN/Inf 中止: {e}", flush=True)
+    if args.nan_dump_dir:
+        print(f"[NanTrap] 临界点现场已保存至: {args.nan_dump_dir}  "
+              f"(运行 `python reproduce_nan.py {args.nan_dump_dir}` 复现)", flush=True)
+    sys.exit(1)

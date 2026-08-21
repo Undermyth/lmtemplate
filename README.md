@@ -22,6 +22,8 @@ A lightweight and modular training template for language model pre-training and 
 ├── train.py               # Training script (Lightning-based)
 ├── test.py                # Evaluation script (lm_eval-based)
 ├── model.py               # LightningModule wrapper with optimizer configuration
+├── nan_tracer.py          # NanTrap: NaN/Inf 临界点捕捉（首次 NaN 时 dump 现场并中止）
+├── reproduce_nan.py       # 离线复现 NanTrap 保存的临界点，定位 NaN 产生的算子
 └── train_utils.py         # Training utilities (schedulers, step calculations)
 ```
 
@@ -82,6 +84,53 @@ This template supports the **Muon** optimizer (Mish et al., 2024) for training. 
 ### Checkpointing
 
 Checkpoints are saved every `--checkpoint-tokens` billion tokens. Evaluation runs `--eval-per-checkpoint` times within each checkpoint interval.
+
+---
+
+## NaN 检测与临界点保存 (NanTrap)
+
+训练中 loss / 梯度 / 权重出现 NaN 或 Inf 时，NanTrap 会在**第一次**出现非有限值的临界点
+自动保存现场并中止训练，便于离线复现与定位。三个检测点（每步依次执行）：
+
+1. **loss**  —— forward 之后、backward 之前检查 loss（含 aux_loss）
+2. **grad**  —— backward 之后、grad clip / optimizer step 之前检查所有参数梯度
+3. **weight**—— optimizer step 之后检查权重（兜底：捕捉"有限梯度被优化器污染成 NaN"的 bug）
+
+DDP 下任一 rank 非有限会先跨 rank all-reduce，所有 rank 一起 dump 并中止，避免单 rank 提前退出卡死。
+不传 `--nan-dump-dir` 时所有检测均为 no-op，训练零开销、零行为变化。
+
+### 启用
+
+```bash
+python train.py ... \
+    --nan-dump-dir ./nan_dump \        # 保存现场并中止
+    --nan-dump-optimizer               # 可选：一并保存优化器状态（体积可能数 GB）
+```
+
+触发后现场保存在 `<nan_dump_dir>/rank{r}_step{s}_{ts}/` 下：
+
+| 文件 | 内容 |
+|------|------|
+| `model.pt`   | 触发时（尚未被 step 污染）的模型权重 |
+| `samples.pt` | 当前梯度累积窗口内的全部 micro-batch 样本 |
+| `rng.pt`     | CPU / CUDA RNG 状态（dropout 等随机性复现用） |
+| `meta.json`  | 触发类型、step、rank、grad_accum、micro_batch 位置、模型 config、git 版本等 |
+| `optimizer.pt` | （可选）优化器状态 |
+
+### 复现与定位
+
+```bash
+python reproduce_nan.py <dump_dir> [--anomaly] [--probe-samples 10]
+```
+
+脚本会原样重放窗口内样本的 forward / backward：
+
+- forward 出现非有限 loss → 用 forward hooks 定位**第一个**出现 inf/NaN 的算子，并打印各层激活的 `max|.|` 轨迹；
+- forward 有限但 backward 非有限 → 列出非有限梯度的参数，用 backward hooks 定位 NaN 产生层，`--anomaly` 可让 torch 直接报出 NaN 算子；
+- `--probe-samples N` 用随机样本探测，区分"该样本触发"还是"权重已病态（任意样本都炸）"。
+
+> 注意：若 dump 的权重本身已含 NaN（`meta.json` 中 `params_all_finite_at_dump=false`），说明属于
+> optimizer 污染场景或检测点过晚，无法复现"首次" NaN。
 
 ---
 
