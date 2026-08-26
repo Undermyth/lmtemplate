@@ -41,10 +41,11 @@ parser.add_argument("--val-sanity", action="store_true")
 parser.add_argument("--eval-tasks", type=str, default=None, help="Comma-separated list of eval tasks, e.g., arc_challenge,arc_easy,lambada_openai")
 parser.add_argument("--dry-run", action="store_true")
 parser.add_argument("--nan-dump-dir", type=str, default=None,
-                    help="NaN 临界点 dump 目录。设置后 NanTrap 会捕捉首次非有限 loss/梯度/权重，"
-                         "保存 (模型权重 + 窗口样本 + RNG + 元信息) 并中止训练，供 reproduce_nan.py 复现。")
+                    help="Directory to dump the NaN trigger point. When set, NanTrap captures the first "
+                         "non-finite loss/gradient/weight, saves (model weights + sample window + RNG + metadata) "
+                         "and aborts training so reproduce_nan.py can reproduce it.")
 parser.add_argument("--nan-dump-optimizer", action="store_true",
-                    help="NaN dump 时一并保存优化器状态（体积可能数 GB，一般不需要）")
+                    help="Also dump optimizer state on NaN (can be several GB; usually not needed)")
 
 # parallelism settings & infra optimization options
 parser.add_argument("--parallel", type=str, default="ddp", choices=["ddp", "zero1", "zero2"])
@@ -65,8 +66,9 @@ parser.add_argument("--grad-clip", type=float, default=None, help="Override grad
 parser.add_argument("--warmup-ratio", type=float, default=None, help="Override warmup_ratio in YAML")
 args = parser.parse_args()
 
-# --resume-checkpoint latest: 自动选择 --checkpoint-dir 下最新的检查点续训；
-# 目录为空或不存在时回退为从头训练。解析后的实际路径会体现在配置表中。
+# --resume-checkpoint latest: auto-resume from the newest checkpoint in --checkpoint-dir,
+# falling back to training from scratch if the dir is empty or missing.
+# The resolved path is shown in the config table below.
 args.resume_checkpoint = resolve_resume_checkpoint(args.resume_checkpoint, args.checkpoint_dir)
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, legacy=False)
@@ -312,8 +314,8 @@ try:
         ckpt_path=args.resume_checkpoint
     )
 except NanTrapTriggered as e:
-    print(f"\n[NanTrap] 训练因 NaN/Inf 中止: {e}", flush=True)
+    print(f"\n[NanTrap] Training aborted due to NaN/Inf: {e}", flush=True)
     if args.nan_dump_dir:
-        print(f"[NanTrap] 临界点现场已保存至: {args.nan_dump_dir}  "
-              f"(运行 `python reproduce_nan.py {args.nan_dump_dir}` 复现)", flush=True)
+        print(f"[NanTrap] Trigger-point snapshot saved to: {args.nan_dump_dir}  "
+              f"(run `python reproduce_nan.py {args.nan_dump_dir}` to reproduce)", flush=True)
     sys.exit(1)

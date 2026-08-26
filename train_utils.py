@@ -3,8 +3,8 @@ from typing import List, Optional
 
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-# --resume-checkpoint 保留字：自动从 checkpoint 目录中寻找最新的检查点并续训。
-# 目录为空或不存在时回退为从头训练。
+# --resume-checkpoint sentinel: auto-resume from the newest checkpoint in the checkpoint dir.
+# Falls back to training from scratch if the dir is empty or missing.
 RESUME_LATEST = "latest"
 
 
@@ -17,44 +17,44 @@ def create_warmup_cosine_scheduler(
     last_epoch: int = -1
 ):
     """
-    创建一个 '线性预热 + 余弦退火' 的组合学习率调度器（无重启）。
-    
-    参数:
-        optimizer (torch.optim.Optimizer): 优化器实例
-        warmup_epochs (int): 预热阶段的 epoch 数量
-        total_epochs (int): 总训练轮数（余弦周期长度）
-        eta_min (float): 余弦退火的最小学习率，默认 1e-6
-        initial_lr (float, optional): 初始学习率。若为 None，则自动从 optimizer 获取
-        last_epoch (int): 上一个 epoch 的索引，用于恢复训练，默认 -1
-    
-    返回:
-        torch.optim.lr_scheduler.ChainedScheduler: 按顺序应用的调度器链
+    Create a combined 'linear warmup + cosine annealing' LR scheduler (no restarts).
+
+    Args:
+        optimizer (torch.optim.Optimizer): the optimizer instance
+        warmup_epochs (int): number of warmup epochs
+        total_epochs (int): total training epochs (cosine cycle length)
+        eta_min (float): minimum LR for cosine annealing, default 1e-6
+        initial_lr (float, optional): initial LR. If None, taken from the optimizer
+        last_epoch (int): index of the last epoch, for resuming training, default -1
+
+    Returns:
+        torch.optim.lr_scheduler.ChainedScheduler: the scheduler chain applied in order
     """
     
     if initial_lr is None:
         initial_lr = optimizer.param_groups[0]['lr']
     
-    # 第一阶段：线性预热（从 0.1 * initial_lr 线性增长到 initial_lr）
+    # Phase 1: linear warmup (from 0.1 * initial_lr up to initial_lr)
     scheduler_warmup = LinearLR(
         optimizer,
-        start_factor=0.1,           # 起始为 10% 的初始学习率
-        end_factor=1.0,             # 结束为 100%
-        total_iters=warmup_epochs,  # 预热总步数
-        last_epoch=last_epoch       # 支持断点恢复
+        start_factor=0.1,           # starts at 10% of the initial LR
+        end_factor=1.0,             # ends at 100%
+        total_iters=warmup_epochs,  # total warmup steps
+        last_epoch=last_epoch       # supports resume
     )
     
-    # 第二阶段：余弦退火（从 pre-warmup 结束后的 lr 开始，衰减到 eta_min）
-    # 注意：余弦周期长度 = total_epochs - warmup_epochs
-    cosine_duration = max(1, total_epochs - warmup_epochs)  # 至少为1，避免除零
+    # Phase 2: cosine annealing (from the post-warmup LR down to eta_min)
+    # note: cosine cycle length = total_epochs - warmup_epochs
+    cosine_duration = max(1, total_epochs - warmup_epochs)  # at least 1, to avoid division by zero
     scheduler_cosine = CosineAnnealingLR(
         optimizer,
-        T_max=cosine_duration,      # 余弦周期长度
+        T_max=cosine_duration,      # cosine cycle length
         eta_min=eta_min,
         last_epoch=last_epoch - warmup_epochs if last_epoch >= warmup_epochs else -1
     )
     
-    # 使用 ChainedScheduler 按顺序串联两个调度器
-    # 注意：ChainedScheduler 会依次调用每个 scheduler.step()
+    # chain the two schedulers in order with SequentialLR
+    # note: SequentialLR calls each scheduler.step() in turn
     scheduler = SequentialLR(
         optimizer=optimizer, 
         schedulers=[scheduler_warmup, scheduler_cosine],
@@ -109,32 +109,32 @@ def get_optimizer_steps(
     return int(optimizer_steps)
 
 def is_deepspeed_checkpoint_dir(path: str) -> bool:
-    """判断 ``path`` 是否为 DeepSpeed 检查点目录（目录而非单文件）。
+    """Whether ``path`` is a DeepSpeed checkpoint directory (a directory, not a single file).
 
-    DeepSpeed 检查点目录的布局与 Lightning 的 ``DeepSpeedStrategy`` / deepspeed
-    的保存逻辑一致（``deepspeed_engine.save_checkpoint(dir, tag="checkpoint")``）：
+    The layout matches Lightning's ``DeepSpeedStrategy`` / deepspeed's saving logic
+    (``deepspeed_engine.save_checkpoint(dir, tag="checkpoint")``):
 
     ::
 
         <name>/
-        ├── checkpoint/                  # tag 子目录
+        ├── checkpoint/                  # tag subdirectory
         │   ├── mp_rank_00_model_states.pt
         │   ├── zero_pp_rank_0_mp_rank_00_optim_states.pt
         │   └── ...
         ├── latest
         └── zero_to_fp32.py
 
-    判定规则与 Lightning 自身的 ``_is_deepspeed_checkpoint`` 保持一致：
-    是目录且包含 ``checkpoint/`` 子目录即视为 DeepSpeed 检查点。
+    The rule matches Lightning's own ``_is_deepspeed_checkpoint``:
+    a directory containing a ``checkpoint/`` subdirectory is a DeepSpeed checkpoint.
     """
     return os.path.isdir(path) and os.path.isdir(os.path.join(path, "checkpoint"))
 
 
 def is_checkpoint_entry(path: str) -> bool:
-    """``path`` 是否是一个可续训的检查点：
+    """Whether ``path`` is a resumable checkpoint:
 
-    - 朴素 DDP 检查点：单个 ``.ckpt`` 文件；
-    - DeepSpeed 检查点：目录（其内容为一组分片文件而非单个文件）。
+    - plain DDP checkpoint: a single ``.ckpt`` file;
+    - DeepSpeed checkpoint: a directory (a set of sharded files rather than a single file).
     """
     if os.path.isfile(path):
         return path.endswith(".ckpt")
@@ -142,10 +142,11 @@ def is_checkpoint_entry(path: str) -> bool:
 
 
 def _entry_mtime(path: str) -> float:
-    """检查点条目的最近修改时间。
+    """Most recent modification time of a checkpoint entry.
 
-    对目录（DeepSpeed 检查点）取目录本身与其直接子项 mtime 的最大值：
-    分片文件是逐个写入目录的，目录自身的 mtime 不一定晚于最后写入的子文件。
+    For a directory (DeepSpeed checkpoint) take the max mtime of the dir itself and its direct
+    children: shard files are written into the dir one by one, so the dir's own mtime may be
+    older than the last written file.
     """
     if os.path.isdir(path):
         try:
@@ -157,13 +158,13 @@ def _entry_mtime(path: str) -> float:
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
-    """扫描 ``checkpoint_dir``，返回其中最新的检查点路径。
+    """Scan ``checkpoint_dir`` and return the path of the newest checkpoint.
 
-    同时支持朴素 ``.ckpt`` 单文件（DDP 模式）与 DeepSpeed 检查点目录。
-    隐藏条目与临时文件（``.`` / ``tmp`` 前缀，如写入中的 ``.tmp.ckpt`` 或
-    尚未落位的临时目录）会被忽略，避免选中未写完的检查点。
+    Supports both plain ``.ckpt`` single files (DDP mode) and DeepSpeed checkpoint directories.
+    Hidden entries and temp files (``.`` / ``tmp`` prefixes, e.g. an in-progress ``.tmp.ckpt`` or
+    a temp dir not yet in place) are ignored to avoid picking an unwritten checkpoint.
 
-    目录不存在、为空或不含任何可识别检查点时返回 ``None``。
+    Returns ``None`` when the dir is missing, empty, or has no recognizable checkpoint.
     """
     if not os.path.isdir(checkpoint_dir):
         return None
@@ -178,14 +179,14 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
 
     if not candidates:
         return None
-    # 以 mtime 排序，最新者优先；mtime 相同（如同步复制）时按名称字典序兜底。
+    # sort by mtime, newest first; tie-break by lexicographic name (e.g. synced copies).
     candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
     return candidates[0][1]
 
 
 def _rank_zero_print(msg: str) -> None:
-    """训练启动前（Trainer 尚未初始化）无法使用 lightning 的 rank_zero_only，
-    直接用 ``RANK`` 环境变量（torchrun 设置）做 rank-0 门控。"""
+    """Before training starts (Trainer not yet initialized) lightning's rank_zero_only is
+    unavailable, so gate on the ``RANK`` env var (set by torchrun) directly."""
     if os.environ.get("RANK", "0") == "0":
         print(msg, flush=True)
 
@@ -194,12 +195,12 @@ def resolve_resume_checkpoint(
     resume_checkpoint: Optional[str],
     checkpoint_dir: str,
 ) -> Optional[str]:
-    """解析 ``--resume-checkpoint`` 参数的实际值。
+    """Resolve the actual value of the ``--resume-checkpoint`` argument.
 
-    - ``None``                    -> ``None``（从头训练）
-    - ``RESUME_LATEST``（"latest"）-> ``checkpoint_dir`` 中最新检查点的路径；
-                                    目录为空/不存在时返回 ``None``（从头训练）
-    - 其他任意值                   -> 原样返回（显式指定路径）
+    - ``None``                    -> ``None`` (train from scratch)
+    - ``RESUME_LATEST`` ("latest")-> path of the newest checkpoint in ``checkpoint_dir``;
+                                    ``None`` if the dir is empty/missing (train from scratch)
+    - any other value             -> returned as-is (explicit path)
     """
     if resume_checkpoint is None:
         return None
@@ -209,8 +210,8 @@ def resolve_resume_checkpoint(
     latest = find_latest_checkpoint(checkpoint_dir)
     if latest is None:
         _rank_zero_print(
-            f"[resume] `{RESUME_LATEST}` 已指定，但 `{checkpoint_dir}` 中没有可用检查点"
-            "（目录不存在或为空），将从零开始训练。"
+            f"[resume] `{RESUME_LATEST}` specified but no usable checkpoint found in `{checkpoint_dir}`"
+            " (dir missing or empty); training from scratch."
         )
     else:
         _rank_zero_print(f"[resume] `{RESUME_LATEST}` -> {latest}")

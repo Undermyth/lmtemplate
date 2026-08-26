@@ -45,8 +45,8 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
         use_gradient_checkpoint: bool = False,
         use_parallel: bool = True,
         use_advanced_parallel: bool = False,    # whether parallel like FSDP/ZeRO is used
-        nan_dump_dir: Optional[str] = None,     # NaN 临界点 dump 目录；None 表示禁用 NanTrap
-        nan_dump_optimizer: bool = False,       # dump 时是否一并保存优化器状态（体积大）
+        nan_dump_dir: Optional[str] = None,     # dir to dump the NaN trigger point; None disables NanTrap
+        nan_dump_optimizer: bool = False,       # whether to also save optimizer state on dump (large)
     ):
         super().__init__()
         self.model = model
@@ -72,7 +72,7 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
         self.automatic_optimization = True
         self.stream_loss = 0
 
-        # NanTrap: 首次 NaN/Inf 临界点捕捉（不传 nan_dump_dir 时全部为 no-op）
+        # NanTrap: capture the first NaN/Inf trigger point (all no-ops when nan_dump_dir is None)
         self._nan_dir = nan_dump_dir
         self._nan_dump_optimizer = nan_dump_optimizer
         self._nan_window = []
@@ -104,14 +104,16 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
         if aux_loss is not None:
             loss = loss + 0.1 * aux_loss
 
-        # NanTrap 检测点 1: forward 之后、backward/step 之前检查 loss（含 aux）
+        # NanTrap check 1: check loss (incl. aux) after forward, before backward/step
         self._nan_track_sample(x, y, batch_idx, state_dict)
         self._nan_trap("loss", loss=loss, aux=aux_loss)
 
         self.stream_loss += loss.item() / self.grad_accum
         if (batch_idx + 1) % self.grad_accum == 0:
             total_norm = torch.stack([torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]).pow(2).sum().pow(0.5)
+            param_norm = torch.stack([torch.norm(p.detach(), 2) for p in self.model.parameters()]).float().pow(2).sum().pow(0.5)
             self.log('train/grad_norm', total_norm, on_step=True, prog_bar=False, logger=True, sync_dist=True)
+            self.log('train/param_norm', param_norm, on_step=True, prog_bar=False, logger=True, sync_dist=True)
             self.log('train/loss', self.stream_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
             if aux_loss is not None:
                 self.log('train/aux_loss', aux_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
@@ -123,14 +125,14 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
 
     def backward(self, loss, *args, **kwargs):
         loss.backward(*args, **kwargs)
-        # NanTrap 检测点 2: backward 之后、grad clip / step 之前检查梯度
+        # NanTrap check 2: check gradients after backward, before grad clip / step
         self._nan_trap("grad")
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
-        # 必须始终传入 closure：梯度裁剪和 on_before_optimizer_step hook
-        # 都在 _after_closure（即 closure 内部）执行，省略 closure 会导致 grad clip 失效。
+        # The closure must always be passed: grad clipping and the on_before_optimizer_step hook
+        # run inside _after_closure (i.e. within the closure); omitting it disables grad clip.
         optimizer.step(closure=optimizer_closure)
-        # NanTrap 检测点 3（兜底）: step 之后检查权重是否被优化器污染
+        # NanTrap check 3 (fallback): check weights for corruption after the optimizer step
         self._nan_trap("weight")
         if self._nan_dir:
             self._nan_window.clear()

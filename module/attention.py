@@ -69,7 +69,7 @@ class Attention(nn.Module):
         self.head_dim = dim // n_heads
         self.rotary_emb_dim = rotary_emb_dim
 
-        # 确保 rotary_emb_dim 不超过 head_dim，并且是偶数
+        # ensure rotary_emb_dim does not exceed head_dim and is even
         assert self.rotary_emb_dim <= self.head_dim, "rotary_emb_dim must be less than or equal to head_dim"
         assert self.rotary_emb_dim % 2 == 0, "rotary_emb_dim must be even"
         assert self.head_dim % 2 == 0, "head_dim must be even"

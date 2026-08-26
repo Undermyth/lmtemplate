@@ -1,34 +1,34 @@
-"""NanTrap —— 捕捉训练中"第一次"出现 NaN/Inf 的临界点并固化现场。
+"""NanTrap -- capture the "first" NaN/Inf trigger point during training and freeze the scene.
 
-核心思想
-========
-训练中 loss 与 grad norm 同时变 NaN 通常是下面两种情形之一：
+Core idea
+=========
+When both loss and grad norm turn NaN during training, it is usually one of two cases:
 
-  * 情形 (a): 某一步 k 的 forward 在权重 W_k 上、对某条样本 sample_k 计算出
-              NaN loss（bf16 溢出 / 病态数值），于是 backward 产生 NaN 梯度。
-  * 情形 (b): forward 的 loss 有限，但 backward 中某个算子（除法、CG 迭代等）
-              产生 NaN 梯度。
+  * Case (a): at step k, forward computes a NaN loss on weight W_k with some sample sample_k
+              (bf16 overflow / ill-conditioned values), so backward produces NaN gradients.
+  * Case (b): forward loss is finite, but some op in backward (division, CG iterations, etc.)
+              produces NaN gradients.
 
-无论哪种情形，**在 optimizer.step() 之前**，权重都还是有限的 W_k：
-保存 (W_k, 触发样本) 之后离线重放，就能在"临界点"上复现首次 NaN，
-再用 hooks / autograd anomaly 定位到具体算子。
+In either case, **before optimizer.step()** the weights are still finite W_k:
+saving (W_k, triggering sample) and replaying offline reproduces the first NaN at the
+"trigger point", then hooks / autograd anomaly pinpoint the exact op.
 
-本模块在三个检测点工作（每个检测点都先做跨 rank 的 all-reduce，任一 rank
-非有限则所有 rank 一起 dump + 中止，避免 DDP 下单 rank 提前退出卡死）：
+This module works at three checkpoints (each does a cross-rank all-reduce first: if any rank
+is non-finite, all ranks dump + abort together, avoiding a deadlock from one rank exiting early):
 
-  1. training_step 中 forward 之后  -> 检查 loss（含 aux_loss）       (kind="loss")
-  2. backward() 中 loss.backward() 之后 -> 检查所有参数梯度           (kind="grad")
-  3. optimizer_step 中 step() 之后  -> 检查权重本身                   (kind="weight", 兜底)
+  1. after forward in training_step     -> check loss (incl. aux_loss)    (kind="loss")
+  2. after loss.backward() in backward  -> check all param gradients      (kind="grad")
+  3. after step() in optimizer_step     -> check weights themselves       (kind="weight", fallback)
 
-其中 (3) 是 (a)/(b) 的盲区兜底：若优化器把有限梯度变成 NaN 权重（例如 Muon
-的 Newton-Schulz 迭代发散这类 bug），此时保存的权重已被污染，(a)/(b) 的
-"正常模型 + 触发样本"前提不成立，dump 的 meta 里 `params_all_finite_at_dump`
-会标记为 False，复现脚本会给出明确警告。
+(3) is the blind-spot fallback for (a)/(b): if the optimizer turns finite gradients into NaN
+weights (e.g. a Muon Newton-Schulz iteration divergence bug), the saved weights are already
+contaminated, the "healthy model + triggering sample" premise of (a)/(b) breaks, and
+`params_all_finite_at_dump` in the dump meta is flagged False; the reproduction script warns clearly.
 
-用法
-====
-给 LightningModule 混入 NanTrapMixin，并把 nan_dump_dir 传给构造函数即可。
-不传 nan_dump_dir 时所有检测均为 no-op，正常训练零开销零行为变化。
+Usage
+=====
+Mix NanTrapMixin into the LightningModule and pass nan_dump_dir to the constructor.
+Without nan_dump_dir all checks are no-ops: zero overhead, zero behavior change.
 """
 
 import json
@@ -46,7 +46,7 @@ __all__ = ["NanTrapTriggered", "NanTrapMixin", "params_finite", "grads_finite"]
 
 
 class NanTrapTriggered(RuntimeError):
-    """捕捉到首个 NaN/Inf 后抛出；train.py 捕获它并打印 dump 位置后退出。"""
+    """Raised once the first NaN/Inf is caught; train.py catches it, prints the dump location, and exits."""
 
 
 def params_finite(module: torch.nn.Module) -> bool:
@@ -83,14 +83,14 @@ def _atomic_save(obj, path: Path):
 
 
 class NanTrapMixin:
-    """混入 L.LightningModule。构造时设置 ``self._nan_dir = nan_dump_dir``（None 则禁用）。"""
+    """Mixin for L.LightningModule. The constructor sets ``self._nan_dir = nan_dump_dir`` (None disables)."""
 
     _nan_dir: Optional[str] = None
     _nan_dump_optimizer: bool = False
     _nan_window: List[Tuple[torch.Tensor, torch.Tensor]] = []
     _nan_last_state: Dict[str, Any] = {}
 
-    # ------------------------------------------------------------- 工具
+    # ------------------------------------------------------------- helpers
     def _nan_rank(self) -> int:
         try:
             return int(self.global_rank)
@@ -105,7 +105,7 @@ class NanTrapMixin:
             return 1
 
     def _nan_any(self, local_bad: bool) -> bool:
-        """任一 rank 非有限则返回 True。必须是所有 rank 同时调用的集体操作。"""
+        """Return True if any rank is non-finite. Must be a collective called by all ranks simultaneously."""
         if not self._nan_dir:
             return local_bad
         if (
@@ -118,9 +118,9 @@ class NanTrapMixin:
             return bool(flag.item())
         return local_bad
 
-    # ------------------------------------------------------------- 检测
+    # ------------------------------------------------------------- checks
     def _nan_track_sample(self, x, y, batch_idx, state_dict):
-        """把当前 micro-batch 记入滚动窗口（CPU 拷贝），供 dump 时保存整窗样本。"""
+        """Record the current micro-batch into the rolling window (CPU copy) for saving full-window samples on dump."""
         if not self._nan_dir:
             return
         try:
@@ -143,7 +143,7 @@ class NanTrapMixin:
             self._nan_window.pop(0)
 
     def _nan_trap(self, kind: str, loss=None, aux=None, extra: Optional[Dict[str, Any]] = None):
-        """kind in {'loss','grad','weight'}：本地检查 -> 跨 rank 协调 -> dump -> 中止。"""
+        """kind in {'loss','grad','weight'}: local check -> cross-rank coordination -> dump -> abort."""
         if not self._nan_dir:
             return
         bad = False
@@ -177,7 +177,7 @@ class NanTrapMixin:
         if not self._nan_any(bad):
             return
         self._nan_dump(kind, details)
-        # 所有 rank 都完成 dump 后再一起中止，避免 IO 耗时差异导致 teardown 竞态
+        # abort all ranks only after every rank finishes dumping, to avoid teardown races from uneven IO time
         if (
             self._nan_world_size() > 1
             and torch.distributed.is_available()
@@ -200,17 +200,17 @@ class NanTrapMixin:
         dump_dir = Path(self._nan_dir) / f"rank{rank}_step{step}_{ts}"
         dump_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1) 权重 W_k（CPU 拷贝）—— 触发 NaN 的 forward 所用的、尚未被 step 污染的权重
+        # 1) weights W_k (CPU copy) -- the weights used by the NaN-triggering forward, not yet polluted by step
         sd = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
         _atomic_save(sd, dump_dir / "model.pt")
 
-        # 2) 当前梯度累积窗口内的全部 micro-batch 样本（触发样本通常是最后一条）
+        # 2) all micro-batch samples in the current grad-accum window (the trigger sample is usually the last one)
         torch.save(
             {i: {"x": x.cpu(), "y": y.cpu()} for i, (x, y) in enumerate(self._nan_window)},
             dump_dir / "samples.pt",
         )
 
-        # 3) RNG 状态（dropout / 非确定性 kernel 复现用）
+        # 3) RNG state (for reproducing dropout / non-deterministic kernels)
         rng: Dict[str, Any] = {"cpu": torch.get_rng_state()}
         try:
             rng["cuda"] = torch.cuda.get_rng_state_all()
@@ -218,12 +218,12 @@ class NanTrapMixin:
             pass
         torch.save(rng, dump_dir / "rng.pt")
 
-        # 4) 元信息
+        # 4) metadata
         cfg = getattr(getattr(self, "model", None), "config", None)
         try:
             model_config = asdict(cfg) if cfg is not None else {}
         except TypeError:
-            # 非 dataclass 的 config（dict / SimpleNamespace 等）直接原样记录
+            # non-dataclass config (dict / SimpleNamespace etc.) is recorded as-is
             model_config = dict(cfg) if isinstance(cfg, dict) else {}
         meta = {
             "kind": kind,
@@ -245,7 +245,7 @@ class NanTrapMixin:
         (dump_dir / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
         print(f"[NanTrap] critical state dumped to {dump_dir}", flush=True)
 
-        # 5) 可选：优化器状态（复现 optimizer 污染场景用，体积可能数 GB）
+        # 5) optional: optimizer state (for reproducing optimizer-corruption scenarios; can be several GB)
         if getattr(self, "_nan_dump_optimizer", False):
             try:
                 opt = self.optimizers()
