@@ -1,0 +1,89 @@
+# ============================================================
+# Optimizer Configuration
+# ============================================================
+# This YAML file drives the entire optimizer setup except for the
+# choice of optimizer algorithm (muon / adam), which is still passed
+# via the `--optimizer` CLI argument in train.py.
+#
+# Param groups are matched **first-match-wins**: earlier groups
+# consume parameters first, and those parameters are excluded from
+# later groups.  If any trainable parameter is left uncovered, an
+# error is raised at startup with a list of the missing params.
+#
+# Each entry under `sources` supports two optional filters, AND-ed
+# together, applied to the params under the submodule reached by `attr`:
+#   dim  : dimension constraint, e.g. "==2", "<2,==3" (comma = OR).
+#   name : regex matched via re.search against the param name RELATIVE
+#          to the submodule (e.g. "attn.q_proj.weight"), NOT the global
+#          model path.  When attr points at a ModuleList (e.g.
+#          "model.layers") the names carry an index prefix like
+#          "0.attn.q_proj.weight".  Use $ anchors to match the whole
+#          tail; an empty match logs a warning but does not fail the run.
+# ============================================================
+
+# --- Global hyperparameters ---
+peak_lr: 0.0006
+warmup_ratio: 0.005
+min_lr_frac: 0.001
+weight_decay: 0.01
+grad_clip: 1.0          # null 表示不使用 gradient clipping
+
+# --- Parameter groups (ordered, first-match-wins) ---
+param_groups:
+
+  # ------------------------------------------------
+  # Group 1: Input Embedding
+  # source: "embedding" → calls model.get_input_embeddings()
+  # ------------------------------------------------
+  - name: "embedding"
+    source: "embedding"
+    lr_mult: 10.0
+    weight_decay: 0.01        # null = use global weight_decay
+    betas: [0.9, 0.95]
+    use_muon: false
+
+  # ------------------------------------------------
+  # Group 2: Output Head (unembedding)
+  # source: "unembedding" → calls model.get_output_embeddings()
+  # ------------------------------------------------
+  - name: "unembedding"
+    source: "unembedding"
+    lr_mult: 0.4
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    use_muon: false
+
+
+  # ------------------------------------------------
+  # Group 4: Hidden 2D params → Muon
+  #   attr: "model.layers" walks the ModuleList of all layers.
+  #   dim: "==2" keeps only 2D weight matrices.
+  #   name: (optional, shown commented) regex on the submodule-relative
+  #         param name, e.g. only attention/MLP weight matrices:
+  #         name: ".*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*weight"
+  #         Combined with dim by AND: only 2D params whose name matches
+  #         enter this group.
+  #   (3D conv filters go to hidden_1d instead.)
+  # ------------------------------------------------
+  - name: "hidden_2d"
+    sources:
+      - attr: "model.layers"
+        dim: "==2"
+    lr_mult: 1.0
+    weight_decay: 0.1
+    use_muon: false
+    muon_momentum: 0.95
+
+  # ------------------------------------------------
+  # Group 5: Hidden 1D + 3D + top-level norms → AdamW
+  #   dim: "<2,==3" means dim < 2  OR  dim == 3
+  # ------------------------------------------------
+  - name: "hidden_1d"
+    sources:
+      - attr: "model.layers"
+        dim: "<2,==3"
+      - attr: "model.norm"
+    lr_mult: 1.0
+    weight_decay: 0.0
+    betas: [0.9, 0.95]
+    use_muon: false

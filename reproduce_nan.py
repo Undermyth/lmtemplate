@@ -1,23 +1,25 @@
 #!/usr/bin/env python
-"""reproduce_nan.py —— 复现 NanTrap 保存的"首次 NaN 临界点"。
+"""reproduce_nan.py -- reproduce the "first NaN trigger point" saved by NanTrap.
 
-用法:
+Usage:
     python reproduce_nan.py <dump_dir> [--no-backward] [--anomaly] [--probe-samples N]
 
-流程:
-  1. 加载 dump: W_k 权重 / 窗口内样本 / RNG / 元信息。
-  2. 校验"正常模型"前提: 权重必须全部有限（否则说明 dump 时权重已被污染，
-     属于 optimizer 污染场景或检测点过晚，无法复现"首次"）。
-  3. 逐条样本原样重放 forward（与训练完全相同的调用方式 / 相同 bf16 / 相同 flag）。
-     - 若 loss/aux 非有限 -> 用 forward hooks 定位第一个出现 inf/NaN 的算子
-       （hooks 挂在所有子模块上，与具体架构无关），并打印各模块激活的 max|.| 轨迹。
-  4. 若 forward 全部有限 -> 重放 forward+backward:
-     - 列出非有限梯度所属参数；用 backward hooks 找 backward 执行顺序中
-       第一个非有限梯度的层（= NaN 产生的位置）；--anomaly 开启 autograd
-       异常检测，让 torch 直接报出产生 NaN 的算子。
-  5. 整窗口累积 forward+backward 复现（与训练梯度累积语义对齐）。
-  6. --probe-samples N: 用随机样本探测 W_k，区分"该样本触发"还是
-     "模型已病态（任意样本都炸）"。
+Procedure:
+  1. Load the dump: W_k weights / window samples / RNG / metadata.
+  2. Verify the "healthy model" premise: all weights must be finite (otherwise the
+     weights were already corrupted at dump time -- an optimizer-corruption scenario
+     or a too-late checkpoint -- and "first" cannot be reproduced).
+  3. Replay forward on each sample exactly as in training (same call / same bf16 / same flags).
+     - If loss/aux is non-finite -> use forward hooks to locate the first op producing inf/NaN
+       (hooks are attached to every submodule, architecture-agnostic), and print the max|.| trace
+       of each module's activations.
+  4. If forward is fully finite -> replay forward+backward:
+     - List the params with non-finite grads; use backward hooks to find the first layer with
+       non-finite grads in backward execution order (= where NaN originates); --anomaly enables
+       autograd anomaly detection so torch reports the offending op directly.
+  5. Replay the full window with accumulated forward+backward (matching training grad-accum semantics).
+  6. --probe-samples N: probe W_k with random samples to tell "this sample triggers it"
+     from "the model is already sick (any sample blows up)".
 """
 import argparse
 import json
@@ -31,7 +33,7 @@ sys.path.insert(0, str(HERE))
 torch.set_float32_matmul_precision("medium")
 
 
-# ---------------------------------------------------------------- dump 加载
+# ---------------------------------------------------------------- dump loading
 def load_dump(dump_dir: Path):
     meta = json.loads((dump_dir / "meta.json").read_text())
     samples = torch.load(dump_dir / "samples.pt", map_location="cpu", weights_only=False)
@@ -96,10 +98,10 @@ def fmt(t):
     return f"{v:.6g}"
 
 
-# ---------------------------------------------------------------- 定位工具
+# ---------------------------------------------------------------- locating utilities
 def _register_all_forward_hooks(root, record):
-    """在 root 的所有子模块（含 root 自身）上挂 forward hook，按 forward 执行
-    顺序把 (name, bad_count, max_abs) 追加到 record。与具体架构无关。"""
+    """Attach forward hooks to all submodules of root (incl. root itself); append
+    (name, bad_count, max_abs) to record in forward execution order. Architecture-agnostic."""
     handles = []
 
     def mk(name):
@@ -122,8 +124,8 @@ def _register_all_forward_hooks(root, record):
 
 
 def finite_report(model, x, y):
-    """无梯度 forward + 全子模块 hooks：返回 (events, first_bad)。events 按
-    forward 执行顺序记录 (name, bad_count, max_abs)。"""
+    """Grad-free forward with all-submodule hooks: returns (events, first_bad). events record
+    (name, bad_count, max_abs) in forward execution order."""
     events = []
     handles = _register_all_forward_hooks(model.model, events)
     try:
@@ -137,8 +139,8 @@ def finite_report(model, x, y):
 
 
 def grad_report(model, x, y, anomaly=False):
-    """forward+backward：返回 (bad_param_names, bwd_events)。bwd_events 按
-    backward 执行顺序记录第一个出现非有限梯度的层（= NaN 产生处）。"""
+    """forward+backward: returns (bad_param_names, bwd_events). bwd_events records the first
+    layer with non-finite grads in backward execution order (= where NaN originates)."""
     model.zero_grad(set_to_none=True)
     if anomaly:
         torch.autograd.set_detect_anomaly(True)
@@ -176,15 +178,15 @@ def grad_report(model, x, y, anomaly=False):
     return bad, bwd_events
 
 
-# ---------------------------------------------------------------- 主流程
+# ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("dump_dir", type=Path)
-    ap.add_argument("--no-backward", action="store_true", help="只重放 forward，不做 backward")
+    ap.add_argument("--no-backward", action="store_true", help="replay forward only, skip backward")
     ap.add_argument("--anomaly", action="store_true",
-                    help="backward 时开启 torch autograd NaN 异常检测（慢，但直接报出 NaN 算子）")
+                    help="enable torch autograd NaN anomaly detection during backward (slow, but pinpoints the NaN op)")
     ap.add_argument("--probe-samples", type=int, default=0,
-                    help="用 N 条随机样本探测 W_k，判断是样本触发还是模型已病态")
+                    help="probe W_k with N random samples to tell sample-triggered from a sick model")
     args = ap.parse_args()
 
     meta, samples, rng = load_dump(args.dump_dir)
@@ -200,11 +202,11 @@ def main():
     ok_weights = params_finite(model)
     if ok_weights:
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"[ok] 权重全部有限（{n_params} 参数）—— '正常模型'前提成立")
+        print(f"[ok] all weights finite ({n_params} params) -- 'healthy model' premise holds")
     else:
-        print("[!!!] 保存的权重并非全部有限 —— dump 时刻权重已被 NaN 污染。")
-        print("      (通常意味着属于 optimizer 污染场景，或检测点设置过晚。)")
-        print("      该 dump 无法复现'首次 NaN'，下面的结果仅供参考。")
+        print("[!!!] saved weights are not all finite -- weights were already NaN-contaminated at dump time.")
+        print("      (usually an optimizer-corruption scenario, or the checkpoint was set too late.)")
+        print("      this dump cannot reproduce the 'first NaN'; results below are for reference only.")
 
     loss_nan_micros = []
     grad_nan_micros = []
@@ -225,7 +227,7 @@ def main():
             events, first_bad = finite_report(model, x, y)
             if first_bad is not None and first_bad_tag is None:
                 first_bad_tag = first_bad[0]
-            # 打印每层的 max|.| 轨迹（只看主干模块，避免 aux 细节刷屏）
+            # print per-layer max|.| trace (backbone modules only, to avoid aux detail spam)
             for name, c, mx in events:
                 parts = name.split(".")
                 is_backbone = (
@@ -236,9 +238,9 @@ def main():
                     flag = "   <== NON-FINITE" if c > 0 else ""
                     print(f"    {name:36s} bad={c:<6d} max|.|={mx:.6g}{flag}")
             if first_bad is not None:
-                print(f"  [定位] 第一个出现 inf/NaN 的算子: {first_bad[0]} (bad={first_bad[1]}, max|.|={first_bad[2]:.6g})")
+                print(f"  [locate] first op with inf/NaN: {first_bad[0]} (bad={first_bad[1]}, max|.|={first_bad[2]:.6g})")
             else:
-                print("  [注意] 中间激活均有限但 loss 非有限 -> 问题可能在 fused CE(内部 logits 溢出) 或 aux_loss")
+                print("  [note] intermediate activations all finite but loss is non-finite -> likely fused CE (internal logits overflow) or aux_loss")
             continue
         if args.no_backward:
             continue
@@ -246,18 +248,18 @@ def main():
         bad, bwd_events = grad_report(model, x, y, anomaly=args.anomaly)
         if bad:
             grad_nan_micros.append(k)
-            print(f"  backward: {len(bad)} 个参数梯度非有限:")
+            print(f"  backward: {len(bad)} params with non-finite grads:")
             for n in bad[:15]:
                 print(f"    grad NaN: {n}")
             if bwd_events:
-                print(f"  [定位] backward 执行顺序中第一个非有限梯度: {bwd_events[0]}")
+                print(f"  [locate] first non-finite grad in backward execution order: {bwd_events[0]}")
         else:
-            print(f"  backward: 梯度全部有限")
+            print("  backward: all grads finite")
 
-    # 整窗口累积复现（对齐训练语义）
+    # full-window accumulated replay (matches training semantics)
     if len(samples) > 1 and not args.no_backward and ok_weights:
         print("-" * 78)
-        print("整窗口累积 forward+backward（与训练梯度累积一致）:")
+        print("full-window accumulated forward+backward (matches training grad accumulation):")
         model.zero_grad(set_to_none=True)
         for k in sorted(samples.keys()):
             s = samples[k]
@@ -266,12 +268,12 @@ def main():
             total.backward()
         bad = [n for n, p in model.named_parameters()
                if p.grad is not None and not bool(torch.isfinite(p.grad).all())]
-        print(f"  累积后非有限梯度参数数: {len(bad)}" + (f"  前几个: {bad[:8]}" if bad else ""))
+        print(f"  params with non-finite grads after accumulation: {len(bad)}" + (f"  first few: {bad[:8]}" if bad else ""))
 
-    # 随机样本探测
+    # random-sample probe
     if args.probe_samples > 0 and ok_weights:
         print("-" * 78)
-        print(f"随机样本探测 (N={args.probe_samples}) —— 判断 W_k 是否'任意样本都炸':")
+        print(f"random-sample probe (N={args.probe_samples}) -- does W_k blow up on any sample?")
         n_bad = 0
         for i in range(args.probe_samples):
             x = torch.randint(0, cfg.vocab_size, (1, 64)).cuda()
@@ -280,24 +282,24 @@ def main():
             fin = bool(torch.isfinite(total).all())
             n_bad += (not fin)
             print(f"  probe {i}: loss={fmt(total)}  finite={fin}")
-        verdict = "权重已病态(任意样本都炸)" if n_bad == args.probe_samples else "样本触发(仅特定样本炸)"
-        print(f"  -> {n_bad}/{args.probe_samples} 条随机样本触发非有限: {verdict}")
+        verdict = "weights sick (blows up on any sample)" if n_bad == args.probe_samples else "sample-triggered (only specific samples)"
+        print(f"  -> {n_bad}/{args.probe_samples} random samples non-finite: {verdict}")
 
     print("=" * 78)
     if loss_nan_micros:
-        print(f"[结论] 复现成功：micro-batch #{loss_nan_micros[0]} 的 forward 首次出现非有限 loss"
-              + (f"，最早的非有限算子: {first_bad_tag}" if first_bad_tag else ""))
+        print(f"[conclusion] reproduced: micro-batch #{loss_nan_micros[0]} forward first shows non-finite loss"
+              + (f", earliest non-finite op: {first_bad_tag}" if first_bad_tag else ""))
     elif grad_nan_micros:
-        print(f"[结论] 复现成功：forward loss 有限，但 micro-batch #{grad_nan_micros[0]} 的 "
-              f"backward 首次出现非有限梯度")
+        print(f"[conclusion] reproduced: forward loss finite, but micro-batch #{grad_nan_micros[0]} "
+              f"backward first shows non-finite grads")
     elif not ok_weights:
-        print("[结论] 复现失败：dump 时权重已被 NaN 污染（optimizer 污染场景），"
-              "无法在保存的样本上复现'首次'。")
+        print("[conclusion] not reproduced: weights were NaN-contaminated at dump time (optimizer-corruption "
+              "scenario); 'first' cannot be reproduced on the saved samples.")
     else:
-        print("[结论] 复现失败：dump 中所有样本 forward/backward 均有限。可能原因：")
-        print("       1) 属于 optimizer 污染场景（有限梯度 -> NaN 权重），需另查 optimizer step；")
-        print("       2) 非确定性 kernel（换 GPU/重跑几次试试）；")
-        print("       3) 触发条件依赖更长的上下文/多窗累积，不在本次保存的窗口内。")
+        print("[conclusion] not reproduced: all saved samples are finite in forward/backward. Possible causes:")
+        print("       1) optimizer-corruption scenario (finite grads -> NaN weights); check the optimizer step separately;")
+        print("       2) non-deterministic kernels (try a different GPU / rerun a few times);")
+        print("       3) the trigger needs longer context / multi-window accumulation, outside the saved window.")
 
 
 if __name__ == "__main__":
