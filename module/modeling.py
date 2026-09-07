@@ -9,7 +9,7 @@ from jaxtyping import Float, Int
 from torch.utils.checkpoint import checkpoint
 
 from .attention import Attention as AttentionBlock
-from fla.layers.simple_gla import SimpleGatedLinearAttention
+from fla.layers.kda import KimiDeltaAttention
 from .cache_utils import Cache
 
 
@@ -73,10 +73,10 @@ class Layer(nn.Module):
         self.post_norm = nn.RMSNorm(self.dim)
 
         # self.attn = AttentionBlock(layer_idx=self.layer_idx, dim=self.dim, n_heads=self.n_heads, rotary_emb_dim=self.rotary_dim)
-        self.attn = SimpleGatedLinearAttention(
+        self.attn = KimiDeltaAttention(
             hidden_size=self.dim,
-            expand_k=1,
             expand_v=1,
+            head_dim=self.head_dim,
             num_heads=self.n_heads,
             layer_idx=self.layer_idx
         )
