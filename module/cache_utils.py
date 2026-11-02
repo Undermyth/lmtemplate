@@ -18,6 +18,10 @@ class Cache:
     def get_sequence_length(self):
         return self._seen_tokens
 
+    def set_sequence_length(self, length: int):
+        """Overwrite the seen-token counter (used when seeding a static cache)."""
+        self._seen_tokens = int(length)
+
     def update(
         self, 
         recurrent_state: Optional[Float[torch.Tensor, 'b h d D']] = None,    # for recurrent models 
