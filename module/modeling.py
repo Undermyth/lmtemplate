@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import time
 
 import torch
 import torch.nn as nn
@@ -7,9 +8,11 @@ from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.modules.mlp import GatedMLP
 from jaxtyping import Float, Int
 from torch.utils.checkpoint import checkpoint
+from fla.layers import PrecondGatedDeltaNet
 
 from .attention import Attention as AttentionBlock
-from .cache_utils import Cache
+# from .cache_utils import Cache
+from fla.models.utils import Cache
 
 
 @dataclass
@@ -71,7 +74,14 @@ class Layer(nn.Module):
         self.input_norm = nn.RMSNorm(self.dim)
         self.post_norm = nn.RMSNorm(self.dim)
 
-        self.attn = AttentionBlock(layer_idx=self.layer_idx, dim=self.dim, n_heads=self.n_heads, rotary_emb_dim=self.rotary_dim)
+        # self.attn = AttentionBlock(layer_idx=self.layer_idx, dim=self.dim, n_heads=self.n_heads, rotary_emb_dim=self.rotary_dim)
+        self.attn = PrecondGatedDeltaNet(
+            hidden_size=self.dim,
+            expand_v=1,
+            head_dim=self.head_dim,
+            num_heads=self.n_heads,
+            layer_idx=layer_idx
+        )
         self.mlp = GatedMLP(hidden_size=config.dim, hidden_ratio=config.expand_ratio)
 
     def forward(
@@ -275,7 +285,7 @@ class ModelForCausalLM(nn.Module):
         generated = input_ids
 
         # Decode loop
-        while past_key_values.get_sequence_length() < target_length:
+        while past_key_values.get_seq_length() < target_length:
             # Apply sampling logic
             if do_sample:
                 # Temperature
@@ -314,7 +324,7 @@ class ModelForCausalLM(nn.Module):
 
             # Prepare for next iteration
             next_token_id = next_token
-            next_position_ids = torch.tensor([past_key_values.get_sequence_length()]).unsqueeze(0).expand(batch_size, -1).to(device)
+            next_position_ids = torch.tensor([past_key_values.get_seq_length()]).unsqueeze(0).expand(batch_size, -1).to(device)
 
             # Extend attention mask (all ones since no padding in generation)
             if attention_mask is not None:

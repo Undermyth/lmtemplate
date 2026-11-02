@@ -34,6 +34,7 @@ task_manager = TaskManager(
     metadata={
         "max_seq_lengths": [1024, 2048, 4096, 8192],
         "shuffle": True,
+        "tokenizer": tokenizer,
         "enable_cache": True,
         "num_samples": 500,
     },

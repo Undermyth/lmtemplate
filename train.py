@@ -290,7 +290,7 @@ if args.parallel != "ddp":
     strategy = DeepSpeedStrategy(config=deepspeed_config, timeout=datetime.timedelta(hours=2))    
 else:
     from lightning.pytorch.strategies import DDPStrategy
-    strategy = DDPStrategy(timeout=datetime.timedelta(hours=2))
+    strategy = DDPStrategy(timeout=datetime.timedelta(hours=4))
 
 trainer = L.Trainer(
     max_epochs=1,
