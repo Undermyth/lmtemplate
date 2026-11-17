@@ -1,9 +1,9 @@
 import argparse
 
-import lm_eval  # type: ignore
+import lm_eval
 import torch
-from lm_eval.models.huggingface import HFLM  # type: ignore
-from lm_eval.tasks import TaskManager  # type: ignore
+from lm_eval.models.huggingface import HFLM
+from lm_eval.tasks import TaskManager
 from transformers import AutoTokenizer
 
 from module.modeling import ModelConfig, ModelForCausalLM
@@ -34,6 +34,7 @@ task_manager = TaskManager(
     metadata={
         "max_seq_lengths": [1024, 2048, 4096, 8192],
         "shuffle": True,
+        "tokenizer": tokenizer,
         "enable_cache": True,
         "num_samples": 500,
     },

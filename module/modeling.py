@@ -182,6 +182,9 @@ class ModelForCausalLM(nn.Module):
         self._decode_engine = None
         self._decode_engine_signature = None
 
+    def tie_weights(self):
+        return None
+
     def get_input_embeddings(self):
         return self.model.emb
     
