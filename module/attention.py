@@ -4,11 +4,14 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from einops import rearrange
+from flash_attn import flash_attn_with_kvcache
 from fla.modules import ShortConvolution
 from jaxtyping import Float, Int
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input, update_layer_cache
 from fla.models.cache_utils import Cache
+
+from .decoding import StaticDecodeCache
 
 @dataclass
 class FlashAttentionConfig:
@@ -115,6 +118,16 @@ class Attention(nn.Module):
         if use_cache:
             assert past_key_values is not None
 
+        # static decode branch: one token per step against preallocated KV
+        # buffers (CUDA-graph friendly), see module/decoding.py for the contract
+        if (
+            use_cache
+            and past_key_values is not None
+            and q_len == 1
+            and isinstance(past_key_values, StaticDecodeCache)
+        ):
+            return self._forward_static_decode(hidden_states, position_embeddings, past_key_values)
+
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             past_state = past_key_values[self.layer_idx]
             q_conv_state, k_conv_state, v_conv_state = past_state['conv_state']
@@ -176,3 +189,59 @@ class Attention(nn.Module):
         )
 
         return o_attn, None, past_key_values    # keep compatible for fla; reserved position for output_attention
+
+    def _forward_static_decode(
+        self,
+        hidden_states: Float[torch.Tensor, 'b t d'],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_values: StaticDecodeCache,
+    ):
+        """One-token decode step against the preallocated KV buffers.
+
+        The new k/v are appended in-kernel by `flash_attn_with_kvcache` at
+        slot `cache_seqlens[i]` (the kernel then attends cache_seqlens[i]+1
+        keys), which is what keeps the append-style cache CUDA-graph safe;
+        the engine advances `cache_seqlens` after each replay.
+        """
+        batch_size, q_len, _ = hidden_states.shape   # q_len == 1
+        layer_state = past_key_values[self.layer_idx]
+        k_buf, v_buf = layer_state['attn_state']
+        q_conv_state, k_conv_state, v_conv_state = layer_state['conv_state']
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        # single-token decode updates the conv caches in place; the returned
+        # state is the same preallocated tensor
+        q, _ = self.q_conv1d(q, cache=q_conv_state, output_final_state=True)
+        k, _ = self.k_conv1d(k, cache=k_conv_state, output_final_state=True)
+        v, _ = self.v_conv1d(v, cache=v_conv_state, output_final_state=True)
+
+        q, k, v = map(lambda x: rearrange(x, "... (h d) -> ... h d", d=self.head_dim), (q, k, v))
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        cos, sin = position_embeddings
+        q = apply_rotary_pos_emb(q, cos, sin, unsqueeze_dim=2)
+        k = apply_rotary_pos_emb(k, cos, sin, unsqueeze_dim=2)
+
+        k_cache = k_buf.view(batch_size, -1, self.n_heads, self.head_dim)
+        v_cache = v_buf.view(batch_size, -1, self.n_heads, self.head_dim)
+        attn_output = flash_attn_with_kvcache(
+            q, k_cache, v_cache,
+            k=k, v=v,
+            cache_seqlens=past_key_values.cache_seqlens,
+            causal=True,
+        )
+        o_attn = attn_output.contiguous().view(-1, q_len, self.dim)
+        o_attn = self.o_proj(o_attn)
+
+        update_layer_cache(
+            self,
+            past_key_values,
+            attn_state=None,    # KV buffers maintained in place by the kernel above
+            conv_state=(q_conv_state, k_conv_state, v_conv_state),
+            offset=q_len,
+        )
+
+        return o_attn, None, past_key_values
