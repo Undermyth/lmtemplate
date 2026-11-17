@@ -7,9 +7,8 @@ from einops import rearrange
 from fla.modules import ShortConvolution
 from jaxtyping import Float, Int
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
-
-from .cache_utils import Cache
+from fla.layers.utils import get_unpad_data, index_first_axis, pad_input, update_layer_cache
+from fla.models.cache_utils import Cache
 
 @dataclass
 class FlashAttentionConfig:
@@ -119,7 +118,8 @@ class Attention(nn.Module):
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             past_state = past_key_values[self.layer_idx]
             q_conv_state, k_conv_state, v_conv_state = past_state['conv_state']
-            key_state, value_state = past_state['key_cache'], past_state['value_cache']
+            key_state, value_state = past_state['attn_state']
+            key_state, value_state = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_dim), (key_state, value_state))
         else:
             q_conv_state, k_conv_state, v_conv_state = None, None, None
             key_state, value_state = None, None
@@ -140,22 +140,24 @@ class Attention(nn.Module):
             q, k, v = map(lambda x: pad_input(x.squeeze(0), indices, batch_size, q_len), (q, k, v))
 
         q, k, v = map(lambda x: rearrange(x, "... (h d) -> ... h d", d=self.head_dim), (q, k, v))
-        q = self.q_norm(q).transpose(1, 2).contiguous()
-        k = self.k_norm(k).transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         cos, sin = position_embeddings
-        q = apply_rotary_pos_emb(q, cos, sin)
-        k = apply_rotary_pos_emb(k, cos, sin)
+        # q/k are in [B, T, H, D] here (transpose to [B, H, T, D] happens below),
+        # so cos/sin [B, T, rd] must be unsqueezed at dim=2, not dim=1
+        q = apply_rotary_pos_emb(q, cos, sin, unsqueeze_dim=2)
+        k = apply_rotary_pos_emb(k, cos, sin, unsqueeze_dim=2)
 
-        # Save current-step k/v before concatenating with past cache
+        # Save current-step k/v before concatenating with past cache, in shape [B, T, H, d]
         current_k = k
         current_v = v
 
         if key_state is not None and value_state is not None:
-            k = torch.cat([key_state, k], dim=-2)
-            v = torch.cat([value_state, v], dim=-2)
+            k = torch.cat([key_state, k], dim=1)
+            v = torch.cat([value_state, v], dim=1)
 
+        q, k, v = map(lambda x: x.transpose(1, 2).contiguous(), (q, k, v))
         attention_interface = ALL_ATTENTION_FUNCTIONS['flash_attention_2']
         attn_output, _ = attention_interface(       # q, k, v in [B, H, T, d], but attn_output in [B, T, H, d]
             self,
@@ -165,16 +167,12 @@ class Attention(nn.Module):
         o_attn = attn_output.contiguous().view(-1, q_len, self.dim)
         o_attn = self.o_proj(o_attn)
 
-        if use_cache:
-            conv_state = None
-            if q_conv_state is not None and k_conv_state is not None and v_conv_state is not None:
-                conv_state = (q_conv_state, k_conv_state, v_conv_state)
-            past_key_values.update(
-                key_state=current_k,
-                value_state=current_v,
-                conv_state=conv_state,
-                layer_idx=self.layer_idx,
-                offset=q_len
-            )
+        update_layer_cache(
+            self,
+            past_key_values,
+            attn_state=(current_k.flatten(2), current_v.flatten(2)) if use_cache else None,
+            conv_state=(q_conv_state, k_conv_state, v_conv_state),
+            offset=q_len,
+        )
 
         return o_attn, None, past_key_values    # keep compatible for fla; reserved position for output_attention

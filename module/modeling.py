@@ -5,12 +5,11 @@ import torch
 import torch.nn as nn
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.modules.mlp import GatedMLP
+from fla.models.cache_utils import Cache
 from jaxtyping import Float, Int
 from torch.utils.checkpoint import checkpoint
 
 from .attention import Attention as AttentionBlock
-from .cache_utils import Cache
-
 
 @dataclass
 class ModelConfig:
@@ -39,8 +38,10 @@ class RotaryEmbedding(nn.Module):
 
         assert self.rotary_dim % 2 == 0
 
-        inv_freq = 1.0 / (self.rotary_base ** (torch.arange(0, self.rotary_dim, 2).float() / self.rotary_dim))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        # [NOTE] inv_freq is NOT stored as a buffer: nn.Module.to(dtype) would cast it
+        # to bfloat16 (only ~8 mantissa bits), and upcasting back to fp32 in forward
+        # cannot recover the lost precision -> phase error grows with position
+        # (measured ~126 rad at position 16384). Recompute it in fp32 every call instead.
 
 
     def forward(
@@ -51,8 +52,8 @@ class RotaryEmbedding(nn.Module):
         Float[torch.Tensor, 'b t rd'], 
         Float[torch.Tensor, 'b t rd']
     ]:
-        self.inv_freq = self.inv_freq.to(position_ids)
-        freqs = torch.einsum('b t, d->b t d', position_ids, self.inv_freq)
+        inv_freq = 1.0 / (self.rotary_base ** (torch.arange(0, self.rotary_dim, 2, device=hidden_state.device, dtype=torch.float32) / self.rotary_dim))
+        freqs = torch.einsum('b t, d->b t d', position_ids.to(torch.float32), inv_freq)
         freqs = torch.cat([freqs, freqs], dim=-1)
         cos = freqs.cos()
         sin = freqs.sin()
@@ -242,6 +243,32 @@ class ModelForCausalLM(nn.Module):
         eos_token_id: int = 2,
         **kwargs
     ):
+        # Inference must not build autograd graphs: otherwise every decode step
+        # retains the graph of its k/v-cache concatenations and activation memory
+        # grows across the loop (observed OOM with batch 4 / 64 new tokens).
+        with torch.no_grad():
+            return self._generate(
+                input_ids, attention_mask, max_length, max_new_tokens, use_cache,
+                past_key_values, temperature, top_k, top_p, do_sample, eos_token_id,
+            )
+
+    def _generate(
+        self,
+        input_ids: Int[torch.Tensor, 'b t'],
+        attention_mask: Optional[Int[torch.Tensor, 'b t']] = None,
+        max_length: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
+        use_cache: bool = True,
+        past_key_values: Optional[Cache] = None,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        do_sample: bool = False,
+        eos_token_id: int = 2,
+    ):
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
         # Determine stopping condition
         if max_new_tokens is None and max_length is None:
             max_new_tokens = 100
@@ -251,9 +278,6 @@ class ModelForCausalLM(nn.Module):
         else:
             target_length = max_length
             max_new_tokens = max_length - input_ids.shape[1]
-
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
 
         # Prefill phase
         position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1).to(device)
@@ -275,7 +299,7 @@ class ModelForCausalLM(nn.Module):
         generated = input_ids
 
         # Decode loop
-        while past_key_values.get_sequence_length() < target_length:
+        while past_key_values.get_seq_length() < target_length:
             # Apply sampling logic
             if do_sample:
                 # Temperature
@@ -314,7 +338,7 @@ class ModelForCausalLM(nn.Module):
 
             # Prepare for next iteration
             next_token_id = next_token
-            next_position_ids = torch.tensor([past_key_values.get_sequence_length()]).unsqueeze(0).expand(batch_size, -1).to(device)
+            next_position_ids = torch.tensor([past_key_values.get_seq_length()]).unsqueeze(0).expand(batch_size, -1).to(device)
 
             # Extend attention mask (all ones since no padding in generation)
             if attention_mask is not None:
