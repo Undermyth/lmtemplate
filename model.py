@@ -1,4 +1,5 @@
 
+from dataclasses import asdict
 from typing import List, Literal, Optional
 
 import lightning as L
@@ -279,6 +280,9 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
             
         
     def on_save_checkpoint(self, checkpoint):
+        # record the model scale spec so test.py can rebuild the matching
+        # ModelConfig without an explicit --model-config
+        checkpoint['model_config'] = asdict(self.model.config)
         pq_idx = torch.tensor([self.pq_idx], device=self.device)        
         rg_idx = torch.tensor([self.rg_idx], device=self.device)
         pq_idx = self.all_gather(pq_idx)

@@ -1,6 +1,8 @@
 import argparse
+import datetime
 import os
 import sys
+from dataclasses import asdict
 
 import lightning as L
 import lightning.pytorch.callbacks as cbs
@@ -12,10 +14,8 @@ from rich.console import Console
 from rich.table import Table
 from torchinfo import summary
 from transformers import AutoTokenizer
-import datetime
-
 from model import LanguageModel
-from module.modeling import ModelConfig, ModelForCausalLM
+from module.modeling import ModelForCausalLM, load_model_config
 from nan_tracer import NanTrapTriggered
 from optim_utils import load_optimizer_config
 from train_utils import get_checkpoint_steps, get_eval_steps, resolve_resume_checkpoint
@@ -52,6 +52,10 @@ parser.add_argument("--parallel", type=str, default="ddp", choices=["ddp", "zero
 parser.add_argument("--gradient-checkpoint", action="store_true")
 parser.add_argument("--offload-optimizer", action="store_true")
 
+# model scale spec: which size the network is built with (see model_0.4b.yaml /
+# model_1.3b.yaml). Resolved relative to cwd, then to the repo root.
+parser.add_argument("--model-config", type=str, default="model_0.4b.yaml",
+                    help="YAML spec file for the model scale (layers, width, heads, ...)")
 # optimize settings
 parser.add_argument("--optimizer-config", type=str, default="optimizer.yaml",
                     help="YAML config file for optimizer hyperparams and param groups")
@@ -73,7 +77,7 @@ args.resume_checkpoint = resolve_resume_checkpoint(args.resume_checkpoint, args.
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, legacy=False)
 
-config = ModelConfig()
+config = load_model_config(args.model_config)
 model = ModelForCausalLM(config).to(torch.bfloat16)
 
 @rank_zero_only
@@ -90,6 +94,14 @@ def log_config_and_model():
         table.add_row(arg, str(val))
 
     console.print(table)
+    console.print()
+
+    model_table = Table(title="Model Configuration", title_style="bold cyan")
+    model_table.add_column("Field", style="cyan", no_wrap=True)
+    model_table.add_column("Value", style="magenta")
+    for key, val in asdict(config).items():
+        model_table.add_row(key, str(val))
+    console.print(model_table)
     console.print()
     summary(model.model)
 
@@ -260,6 +272,11 @@ if args.log_to_wandb:
     logger = WandbLogger(project=args.wandb_project, name=args.wandb_runname)
     wandb_run = logger.experiment
     wandb_log_code(wandb_run)
+    # capture the model scale spec on the dashboard, alongside the optimizer config
+    wandb_run.config.update(
+        {"model": {**asdict(config), "config_file": args.model_config}},
+        allow_val_change=True,
+    )
 else:
     logger = CSVLogger(save_dir='./logs/', flush_logs_every_n_steps=50)
 
