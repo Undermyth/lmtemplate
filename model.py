@@ -4,7 +4,6 @@ from typing import List, Literal, Optional
 import lightning as L
 import lm_eval  # type: ignore
 import torch
-from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam as ZeroMuonWithAuxAdam
 from lm_eval.models.huggingface import HFLM  # type: ignore
 from lm_eval.tasks import TaskManager  # type: ignore
 from rich.pretty import pprint
@@ -21,6 +20,30 @@ from optim_utils import (
     validate_param_coverage,
 )
 from train_utils import create_warmup_cosine_scheduler, get_optimizer_steps
+
+
+# ZeRO + Muon needs the muon optimizer module introduced in deepspeed 0.20.0.
+# Keep deepspeed imports lazy so that plain DDP runs do not hard-require deepspeed.
+DEEPSPEED_ZERO_MUON_MIN_VERSION = "0.20.0"
+
+
+def _load_zero_muon_optimizer():
+    """Lazily import deepspeed's ZeRO Muon optimizer with a readable error message.
+
+    Called only from the ZeRO branch of ``build_muon_optimizers`` so that environments
+    without (or with an older) deepspeed can still train in DDP mode.
+    """
+    try:
+        from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam as ZeroMuonWithAuxAdam
+    except ImportError as e:
+        raise RuntimeError(
+            f"ZeRO + Muon requires deepspeed >= {DEEPSPEED_ZERO_MUON_MIN_VERSION} "
+            "(module `deepspeed.runtime.zero.muon`); got: "
+            f"{e.__class__.__name__}: {e}. "
+            "Install/upgrade deepspeed, e.g. `uv pip install 'deepspeed>=0.20.0'`, "
+            "or run with `--parallel ddp`."
+        ) from e
+    return ZeroMuonWithAuxAdam
 
 
 # recommended optimize config for AdamW:
@@ -69,6 +92,10 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
         self.pq_idx = 0
         self.rg_idx = None
 
+        # global grad norm cached from the DeepSpeed engine (ZeRO path only, see
+        # `optimizer_step` / `_read_zero_global_grad_norm`); None until the first engine step
+        self._zero_global_grad_norm = None
+
         self.automatic_optimization = True
         self.stream_loss = 0
 
@@ -110,15 +137,41 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
 
         self.stream_loss += loss.item() / self.grad_accum
         if (batch_idx + 1) % self.grad_accum == 0:
-            total_norm = torch.stack([torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]).pow(2).sum().pow(0.5)
+            if self.use_advanced_parallel:
+                # [ZeRO-1/2] DeepSpeed's gradient hooks move p.grad into the flat partition
+                # buffers and clear it during backward (stage_1_and_2.clear_grad_attribute),
+                # so at this boundary every p.grad is None and stacking local grads would
+                # either crash ("stack expects a non-empty TensorList") or report a fake 0.
+                # The global norm is instead read from the DeepSpeed engine, which all-reduces
+                # it inside its own optimizer step; `_read_zero_global_grad_norm` is called
+                # right after that step in `optimizer_step` and cached in
+                # `self._zero_global_grad_norm` (same one-step lag as the DDP path).
+                # NOTE on magnitudes: with ZeRO-1/2 + Muon, DeepSpeed orthogonalizes the
+                # gradient while filling the flat partition ("the gradient already holds the
+                # update", deepspeed muon_optimizer), so the engine's `_global_grad_norm` is
+                # the norm of the Muon-whitened update direction, NOT the raw-grad norm the
+                # DDP path computes. The two are not comparable in magnitude by design; the
+                # engine value is exactly what DeepSpeed uses for overflow/clipping decisions.
+                grad_norm = self._zero_global_grad_norm
+            else:
+                local_grads = [torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]
+                if local_grads:
+                    grad_norm = torch.stack(local_grads).pow(2).sum().pow(0.5)
+                else:
+                    # batch 0 (grad_accum=1): Lightning runs training_step before backward,
+                    # so no gradient exists yet and p.grad is all None. Skip the metric for
+                    # this single step instead of crashing ("stack expects a non-empty
+                    # TensorList") or reporting a fake 0.
+                    grad_norm = None
             param_norm = torch.stack([torch.norm(p.detach(), 2) for p in self.model.parameters()]).float().pow(2).sum().pow(0.5)
-            self.log('train/grad_norm', total_norm, on_step=True, prog_bar=False, logger=True, sync_dist=True)
+            if grad_norm is not None:
+                self.log('train/grad_norm', grad_norm, on_step=True, prog_bar=False, logger=True, sync_dist=True)
             self.log('train/param_norm', param_norm, on_step=True, prog_bar=False, logger=True, sync_dist=True)
             self.log('train/loss', self.stream_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
             if aux_loss is not None:
                 self.log('train/aux_loss', aux_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
             self.stream_loss = 0
-        
+
         self.log('train/pq_idx', self.pq_idx.item(), on_step=True, prog_bar=True, logger=False)
         self.log('train/rg_idx', self.rg_idx.item(), on_step=True, prog_bar=True, logger=False)
         return loss
@@ -136,49 +189,94 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
         self._nan_trap("weight")
         if self._nan_dir:
             self._nan_window.clear()
+        if self.use_advanced_parallel:
+            # Read DeepSpeed's all-reduced global grad norm right after the engine step and
+            # cache it; training_step logs it at the accumulation boundary. Mirrors what
+            # `engine.get_global_grad_norm()` reports (also mirrored into wandb by
+            # Lightning's deepspeed strategy).
+            self._zero_global_grad_norm = self._read_zero_global_grad_norm()
+
+    def _read_zero_global_grad_norm(self):
+        """Global (all-reduced) grad norm reported by the DeepSpeed engine after its step.
+
+        Returns None when the engine has not produced a norm for the current step
+        (e.g. before the first optimizer step); callers skip logging instead of
+        reporting a fake 0.
+        """
+        engine = getattr(self.trainer.strategy, "model", None) if self.trainer is not None else None
+        if engine is None:
+            return None
+        norm = None
+        if hasattr(engine, "get_global_grad_norm"):
+            norm = engine.get_global_grad_norm()
+        if norm is None:
+            # fallback: the value cached on the ZeRO optimizer wrapper
+            norm = getattr(getattr(engine, "optimizer", None), "_global_grad_norm", None)
+        if norm is None or not torch.is_tensor(norm) and not isinstance(norm, (int, float)):
+            return None
+        return float(norm)
 
     def validation_step(self, batch, idx):
         pass
 
     def on_validation_epoch_end(self):
-        if self.global_rank == 0:
-            self.model.device = torch.device(f'cuda:{self.global_rank}')
-            model = HFLM(
-                pretrained=self.model,
-                tokenizer=self.tokenizer,
-                backend='causal',
-                add_bos_token=True,
-                max_length=16384,
-            )
-            task_manager = TaskManager(
-                metadata={
-                    "max_seq_lengths": [1024, 2048, 4096],
-                    "tokenizer": self.tokenizer,
-                    "shuffle": True,
-                    "enable_cache": True,
-                    "num_samples": 100,
-                },
-            )
-            results = lm_eval.simple_evaluate(
-                model=model,
-                task_manager=task_manager,
-                tasks=self.eval_tasks,
-                batch_size=4,
-                apply_chat_template=False
-            )        
-            pprint(results['results'], expand_all=True, indent_guides=True)
-            for task_name, result in results['results'].items():
-                if 'niah' in task_name:
-                    for metric_name, metric in result.items():
-                        if metric_name.split(',')[0].isdigit():
-                            self.log(f'{task_name}/{metric_name.split(",")[0]}-acc', metric, logger=True)
-                else:
-                    if 'acc,none' in result.keys():
-                        self.log(f'{task_name}/acc', result['acc,none'], logger=True)
-                    if 'perplexity,none' in result.keys():
-                        self.log(f'{task_name}/perplexity', result['perplexity,none'], logger=True)
+        if self.global_rank == 0 and self.eval_tasks:
+            try:
+                self._run_eval_and_log()
+            except Exception:
+                # rank0-only eval must never kill the training run: a failure here (e.g. an
+                # offline HF dataset raising ConnectionError) previously propagated out of
+                # this hook, crashed rank0 and tore down NCCL for every rank
+                # ("broken pipe"). Log NaN placeholders instead so the metric keys still
+                # exist in the dashboard, and let all ranks reach the barrier below.
+                import traceback
+
+                traceback.print_exc()
+                self.print('[eval] mid-training evaluation failed; logging NaN placeholders and continuing training')
+                for task_name in self.eval_tasks:
+                    self.log(f'{task_name}/acc', float('nan'), logger=True)
+                    self.log(f'{task_name}/perplexity', float('nan'), logger=True)
+        # all ranks must reach this barrier so that rank0's eval time does not desync the
+        # training loop
         self.trainer.strategy.barrier()
-                
+
+    def _run_eval_and_log(self):
+        self.model.device = torch.device(f'cuda:{self.global_rank}')
+        model = HFLM(
+            pretrained=self.model,
+            tokenizer=self.tokenizer,
+            backend='causal',
+            add_bos_token=True,
+            max_length=16384,
+        )
+        task_manager = TaskManager(
+            metadata={
+                "max_seq_lengths": [1024, 2048, 4096],
+                "tokenizer": self.tokenizer,
+                "shuffle": True,
+                "enable_cache": True,
+                "num_samples": 100,
+            },
+        )
+        results = lm_eval.simple_evaluate(
+            model=model,
+            task_manager=task_manager,
+            tasks=self.eval_tasks,
+            batch_size=4,
+            apply_chat_template=False
+        )        
+        pprint(results['results'], expand_all=True, indent_guides=True)
+        for task_name, result in results['results'].items():
+            if 'niah' in task_name:
+                for metric_name, metric in result.items():
+                    if metric_name.split(',')[0].isdigit():
+                        self.log(f'{task_name}/{metric_name.split(",")[0]}-acc', metric, logger=True)
+            else:
+                if 'acc,none' in result.keys():
+                    self.log(f'{task_name}/acc', result['acc,none'], logger=True)
+                if 'perplexity,none' in result.keys():
+                    self.log(f'{task_name}/perplexity', result['perplexity,none'], logger=True)
+            
         
     def on_save_checkpoint(self, checkpoint):
         pq_idx = torch.tensor([self.pq_idx], device=self.device)        
@@ -222,9 +320,9 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
         )
         validate_param_coverage(self.model, param_groups, uncovered)
 
-        Muon = SingleDeviceMuonWithAuxAdam 
+        Muon = SingleDeviceMuonWithAuxAdam
         if distributed:
-            Muon = ZeroMuonWithAuxAdam if use_zero else DDPMuonWithAdam
+            Muon = _load_zero_muon_optimizer() if use_zero else DDPMuonWithAdam
         optimizer = Muon(param_groups)
         scheduler = create_warmup_cosine_scheduler(
             optimizer=optimizer, warmup_epochs=warmup_steps, total_epochs=optimizer_steps, eta_min=self.optimize_config.min_lr_frac * peak_lr
