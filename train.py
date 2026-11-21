@@ -198,6 +198,15 @@ if args.warmup_ratio is not None:
 if args.parallel != "ddp" and args.optimizer == "muon" and optimize_config.grad_clip is not None:
     raise RuntimeError("ZeRO with Muon does not support grad_clip currently")
 
+if args.parallel != "ddp" and args.nan_dump_dir:
+    print(
+        "[warn] --nan-dump-dir with ZeRO: Lightning's deepspeed strategy silently skips "
+        "NanTrap's gradient-checkpoint hooks (params/grads are partitioned across ranks); "
+        "only the loss/weight traps are reliable, so a missing grad dump does not mean the "
+        "gradients were NaN-free.",
+        flush=True,
+    )
+
 model = LanguageModel(
     model=model,
     tokenizer=tokenizer,
@@ -207,7 +216,6 @@ model = LanguageModel(
     grad_accum_steps=args.grad_accum_steps,
     n_gpus=args.ngpus,
     optimize_tokens=args.optimize_tokens,
-    eval_tasks=args.eval_tasks.split(","),
     optimizer=args.optimizer,
     optimize_config=optimize_config,
     use_gradient_checkpoint=args.gradient_checkpoint,
@@ -215,6 +223,7 @@ model = LanguageModel(
     use_advanced_parallel=(args.parallel != "ddp"),
     nan_dump_dir=args.nan_dump_dir,
     nan_dump_optimizer=args.nan_dump_optimizer,
+    eval_tasks=args.eval_tasks.split(",") if args.eval_tasks else [],
 )
 
 if args.dry_run:
@@ -269,25 +278,73 @@ eval_steps = get_eval_steps(
     n_gpus=args.ngpus,
     micro_batch_size=args.micro_batch_size,
     seq_len=args.seqlen
+) if args.eval_tasks else None
+
+eval_trainer_kwargs = (
+    {"val_check_interval": eval_steps}
+    if eval_steps is not None else
+    # no mid-training eval requested (--eval-tasks not given): disable the validation
+    # loop entirely instead of failing on `None.split(",")` or running an empty eval
+    {"limit_val_batches": 0}
 )
+
+def ensure_deepspeed_zero_muon(parallel: str):
+    """Fail early with a readable message when ZeRO mode cannot get deepspeed's Muon support.
+
+    The `deepspeed.runtime.zero.muon` module exists since deepspeed 0.20.0; older (or missing)
+    installs make every ZeRO run crash deep inside optimizer construction.
+    """
+    try:
+        import deepspeed  # noqa: F401
+        from deepspeed.runtime.zero import muon  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            f"`--parallel {parallel}` requires deepspeed >= 0.20.0 "
+            f"(module `deepspeed.runtime.zero.muon`); got {e.__class__.__name__}: {e}. "
+            "Install/upgrade deepspeed (e.g. `uv pip install 'deepspeed>=0.20.0'`), "
+            "or run with `--parallel ddp`."
+        ) from e
+
 
 if args.parallel != "ddp":
     # load deepspeed basic configuration
     import json
 
-    from lightning.pytorch.strategies import DeepSpeedStrategy
-    with open('deepspeed.json', 'r') as f:
-        deepspeed_config = json.load(f)
-    
-    # update with cmd args
-    if args.parallel == "zero1":
-        deepspeed_config["zero_optimization"]["stage"] = 1
-    elif args.parallel == "zero2":
-        deepspeed_config["zero_optimization"]["stage"] = 2
-    if not args.offload_optimizer:
-        deepspeed_config["zero_optimization"].pop("offload_optimizer")
+    ensure_deepspeed_zero_muon(args.parallel)
 
-    strategy = DeepSpeedStrategy(config=deepspeed_config, timeout=datetime.timedelta(hours=2))    
+    from lightning.pytorch.strategies import DeepSpeedStrategy
+    # the template lives next to train.py; fall back to cwd for older layouts
+    deepspeed_json = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deepspeed.json')
+    if not os.path.isfile(deepspeed_json):
+        deepspeed_json = 'deepspeed.json'
+    with open(deepspeed_json, 'r') as f:
+        deepspeed_config = json.load(f)
+
+    zero_cfg = deepspeed_config.get("zero_optimization")
+    if not isinstance(zero_cfg, dict):
+        raise RuntimeError(f"deepspeed.json ({deepspeed_json}): missing 'zero_optimization' section")
+    stage = zero_cfg.get("stage")
+    if stage not in (1, 2):
+        raise RuntimeError(
+            f"deepspeed.json ({deepspeed_json}): zero_optimization.stage must be 1 or 2, got {stage!r}"
+        )
+
+    # update with cmd args
+    expected_stage = {"zero1": 1, "zero2": 2}[args.parallel]
+    if stage != expected_stage:
+        print(f"[deepspeed] overriding zero_optimization.stage {stage} -> {expected_stage} "
+              f"(from --parallel {args.parallel})", flush=True)
+    zero_cfg["stage"] = expected_stage
+    # keep the engine's bookkeeping batch size in sync with the real micro batch size
+    deepspeed_config["train_micro_batch_size_per_gpu"] = args.micro_batch_size
+
+    if args.offload_optimizer:
+        zero_cfg.setdefault("offload_optimizer", {"device": "cpu", "pin_memory": True})
+    else:
+        # optimizer offload is opt-in via --offload-optimizer; remove any stale entry from the json
+        zero_cfg.pop("offload_optimizer", None)
+
+    strategy = DeepSpeedStrategy(config=deepspeed_config, timeout=datetime.timedelta(hours=2))
 else:
     from lightning.pytorch.strategies import DDPStrategy
     strategy = DDPStrategy(timeout=datetime.timedelta(hours=2))
@@ -300,8 +357,8 @@ trainer = L.Trainer(
     precision="bf16-mixed",
     callbacks=[checkpoint_callback, prog_callback, lr_monitor],
     logger=logger,
-    log_every_n_steps=20, 
-    val_check_interval=eval_steps,
+    log_every_n_steps=20,
+    **eval_trainer_kwargs,
     num_sanity_val_steps=-1 if args.val_sanity else 0,
     accumulate_grad_batches=args.grad_accum_steps,
     gradient_clip_val=optimize_config.grad_clip,

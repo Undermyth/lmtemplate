@@ -117,17 +117,58 @@ def is_deepspeed_checkpoint_dir(path: str) -> bool:
     ::
 
         <name>/
-        ├── checkpoint/                  # tag subdirectory
+        ├── checkpoint/                  # tag subdirectory (`<path>/<tag>`, tag from `latest`)
         │   ├── mp_rank_00_model_states.pt
         │   ├── zero_pp_rank_0_mp_rank_00_optim_states.pt
         │   └── ...
-        ├── latest
+        ├── latest                       # contains the tag name (e.g. "checkpoint")
         └── zero_to_fp32.py
 
     The rule matches Lightning's own ``_is_deepspeed_checkpoint``:
     a directory containing a ``checkpoint/`` subdirectory is a DeepSpeed checkpoint.
     """
     return os.path.isdir(path) and os.path.isdir(os.path.join(path, "checkpoint"))
+
+
+def is_complete_deepspeed_checkpoint(path: str, world_size: Optional[int] = None) -> bool:
+    """Whether a DeepSpeed checkpoint directory looks complete (not killed mid-save).
+
+    deepspeed has no atomic rename, so a run killed during ``save_checkpoint`` can leave a
+    directory with only some of the shards written; its mtime still makes it the newest
+    candidate for ``--resume-checkpoint latest``. This checks:
+
+    - the ``latest`` marker file exists and names an existing tag subdirectory
+      (``<path>/<tag>/``; for Lightning/deepspeed the tag is ``checkpoint``);
+    - when ``world_size`` is known (from the ``WORLD_SIZE`` env var under torchrun),
+      the number of pipeline/optim shard files matches it.
+    """
+    if not is_deepspeed_checkpoint_dir(path):
+        return False
+    latest_marker = os.path.join(path, "latest")
+    if not os.path.isfile(latest_marker):
+        return False
+    try:
+        with open(latest_marker, "r") as f:
+            tag = f.read().strip()
+    except OSError:
+        return False
+    tag_dir = os.path.join(path, tag) if tag else None
+    if not tag_dir or not os.path.isdir(tag_dir):
+        return False
+    if world_size is not None:
+        # one optimizer-state shard per rank (model_states.pt is written once per pipeline
+        # stage, not once per rank, so it must not be counted towards world_size)
+        shard_names = [name for name in os.listdir(tag_dir) if "optim_states.pt" in name]
+        if shard_names and len(shard_names) < world_size:
+            return False
+    return True
+
+
+def _world_size_from_env() -> Optional[int]:
+    try:
+        return int(os.environ["WORLD_SIZE"])
+    except (KeyError, ValueError):
+        return None
 
 
 def is_checkpoint_entry(path: str) -> bool:
@@ -181,7 +222,24 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
         return None
     # sort by mtime, newest first; tie-break by lexicographic name (e.g. synced copies).
     candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
-    return candidates[0][1]
+
+    # Skip DeepSpeed checkpoint directories that look incomplete (killed mid-save): prefer
+    # the next-newest complete candidate instead of failing on load.
+    world_size = _world_size_from_env()
+    for _, path in candidates:
+        if is_deepspeed_checkpoint_dir(path) and not is_complete_deepspeed_checkpoint(path, world_size):
+            _rank_zero_print(
+                f"[resume] skipping incomplete DeepSpeed checkpoint `{path}` "
+                "(missing `latest` marker or incomplete shard set; likely killed during save)"
+            )
+            continue
+        return path
+
+    _rank_zero_print(
+        f"[resume] all {len(candidates)} checkpoint candidate(s) in `{checkpoint_dir}` are "
+        "incomplete; training from scratch."
+    )
+    return None
 
 
 def _rank_zero_print(msg: str) -> None:
