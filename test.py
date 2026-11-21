@@ -19,9 +19,7 @@ parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to 
                     "(a Lightning .ckpt file or a DeepSpeed checkpoint directory)")
 parser.add_argument("--tasks", type=str, default="hellaswag,winogrande,piqa", help="Comma-separated list of eval tasks")
 parser.add_argument("--convert-output-dir", type=str, default=None,
-                    help="Directory for the automatic zero_to_fp32.py conversion output (default: a temp dir "
-                         "under $TMPDIR, /tmp). Point this at a large disk (e.g. /data2/csy/tmp) when the "
-                         "root filesystem is nearly full: the converted fp32 state dict is model-size (~GB).")
+                    help="Directory for the automatic zero_to_fp32.py conversion output (default: a temp dir under $TMPDIR, /tmp).")
 args = parser.parse_args()
 
 
