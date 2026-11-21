@@ -1,8 +1,10 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import yaml
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.modules.mlp import GatedMLP
 from fla.layers.kda import KimiDeltaAttention
@@ -23,6 +25,80 @@ class ModelConfig:
     expand_ratio: int = 4
     rotary_base: int = 10000
     key_expand: int = 2
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelConfig":
+        """Build a ModelConfig from a plain dict (e.g. a loaded model-scale yaml).
+
+        Unknown keys are rejected loudly instead of being silently ignored: branches
+        may add/remove ModelConfig fields, so a stale yaml must fail at startup with
+        the offending key names rather than mis-configure the model. Missing keys
+        fall back to the dataclass defaults.
+        """
+        known = {f.name for f in fields(cls)}
+        unknown = set(d) - known
+        if unknown:
+            raise ValueError(
+                f"Unknown model-config keys: {sorted(unknown)}. "
+                f"Known keys: {sorted(known)}. "
+                "If this branch's ModelConfig has different fields, adjust this "
+                "branch's yaml copy accordingly."
+            )
+        config = cls(**d)
+        # surface structural errors at config-load time instead of deep inside
+        # module constructors (Attention / LanguageModel also assert these)
+        if config.dim % config.n_heads != 0:
+            raise ValueError(
+                f"model config: dim ({config.dim}) must be divisible by n_heads ({config.n_heads})"
+            )
+        if config.rotary_dim > config.dim // config.n_heads:
+            raise ValueError(
+                f"model config: rotary_dim ({config.rotary_dim}) must not exceed "
+                f"head_dim ({config.dim // config.n_heads})"
+            )
+        if config.n_layers % 2 != 0:
+            raise ValueError(f"model config: n_layers ({config.n_layers}) must be even")
+        return config
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "ModelConfig":
+        """Load a ModelConfig from a model-scale yaml file."""
+        with open(path, "r") as f:
+            raw = yaml.safe_load(f)
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"{path}: expected a mapping of model-config keys, got {type(raw).__name__}"
+            )
+        return cls.from_dict(raw)
+
+
+def load_model_config(path: str) -> ModelConfig:
+    """Load a model-scale spec yaml (e.g. model_0.4b.yaml) into a ModelConfig.
+
+    The path is used as given when it exists (absolute or cwd-relative); otherwise
+    it is resolved relative to the repository root (the directory containing
+    train.py, i.e. the parent of module/), mirroring how deepspeed.json is
+    resolved. A missing file raises with every searched location listed.
+    """
+    given = Path(path)
+    candidates = [given]
+    if not given.is_absolute():
+        repo_root = Path(__file__).resolve().parent.parent
+        candidates.append(repo_root / path)
+    for candidate in candidates:
+        if candidate.is_file():
+            config = ModelConfig.from_yaml(str(candidate))
+            print(
+                f"[model-config] loaded {candidate} "
+                f"(dim={config.dim}, n_heads={config.n_heads}, n_layers={config.n_layers})",
+                flush=True,
+            )
+            return config
+    searched = ", ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"model config yaml not found: {path} (searched: {searched}). "
+        "Pass an explicit --model-config or create the file."
+    )
 
 @dataclass
 class ModelOutput:

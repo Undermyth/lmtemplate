@@ -19,6 +19,8 @@ A lightweight and modular training template for language model pre-training and 
 │   └── modeling.py        # HuggingFace-style architecture (RotaryEmbedding, Layer, LanguageModel, ModelForCausalLM)
 ├── data/
 │   └── stream_parquet.py  # Streaming dataset loader for parquet files
+├── model_0.4b.yaml        # Model scale spec: 0.4B (previous hard-coded defaults)
+├── model_1.3b.yaml        # Model scale spec: 1.3B (fla KDA default configuration)
 ├── train.py               # Training script (Lightning-based)
 ├── test.py                # Evaluation script (lm_eval-based)
 ├── model.py               # LightningModule wrapper with optimizer configuration
@@ -47,6 +49,7 @@ A lightweight and modular training template for language model pre-training and 
 python train.py \
     --tokenizer-name meta-llama/Llama-2-7b \
     --parquet-path /path/to/training/data.parquet \
+    --model-config model_0.4b.yaml \
     --seqlen 2048 \
     --micro-batch-size 6 \
     --ngpus 4 \
@@ -65,6 +68,7 @@ python train.py \
 |----------|-------------|---------|
 | `--tokenizer-name` | Pretrained tokenizer name or path | `meta-llama/Llama-2-7b` |
 | `--parquet-path` | Path to training parquet file | **required** |
+| `--model-config` | Model scale spec yaml (see below) | `model_0.4b.yaml` |
 | `--seqlen` | Training sequence length | `2048` |
 | `--micro-batch-size` | Batch size per GPU | `6` |
 | `--ngpus` | Number of GPUs for DDP | `4` |
@@ -168,6 +172,7 @@ python reproduce_nan.py <dump_dir> [--anomaly] [--probe-samples 10]
 python test.py \
     --tokenizer-name meta-llama/Llama-2-7b \
     --checkpoint-path /path/to/checkpoint.pt \
+    --model-config model_0.4b.yaml \
     --tasks hellaswag,winogrande,piqa
 ```
 
@@ -177,18 +182,53 @@ python test.py \
 |----------|-------------|---------|
 | `--tokenizer-name` | Pretrained tokenizer name or path | `meta-llama/Llama-2-7b` |
 | `--checkpoint-path` | Path to model checkpoint | **required** |
+| `--model-config` | Model scale spec yaml (see below) | checkpoint metadata, else `model_0.4b.yaml` |
 | `--tasks` | Comma-separated list of lm_eval tasks | `hellaswag,winogrande,piqa` |
 
 ---
 
-## ModelConfig Defaults
+## Model Scale Configuration
 
-```python
-vocab_size: int = 32000
-n_layers: int = 16
-dim: int = 1024
-n_heads: int = 8
-expand_ratio: int = 4
-rotary_dim: int = 128
-rotary_base: int = 10000
+The model scale is specified in a yaml file instead of being hard-coded in
+`ModelConfig`. Every entry point (`train.py`, `test.py`, `fast_test.py`) selects
+it via `--model-config <path>`; the path is resolved as given first (absolute or
+cwd-relative), then relative to the repository root.
+
+Two specs ship with the template:
+
+| File | Scale | Notes |
+|------|-------|-------|
+| `model_0.4b.yaml` | 0.4B | exactly the previous hard-coded `ModelConfig` defaults |
+| `model_1.3b.yaml` | ~1.3B | `dim 2048 / n_heads 16` (head_dim 128 unchanged) from fla's KDA default configuration (`fla/models/kda/configuration_kda.py`); ~1.37B on the full-attention main architecture, ~1.3B on the linear-attention branches |
+
+Fields (semantics follow `module/modeling.py::ModelConfig`):
+
+```yaml
+vocab_size: 32000
+n_layers: 24
+dim: 1024            # 1.3B spec: 2048
+rotary_dim: 128
+n_heads: 8           # 1.3B spec: 16
+expand_ratio: 4
+rotary_base: 10000
+key_expand: 2
 ```
+
+Behavior and safety:
+
+- Missing keys fall back to the `ModelConfig` dataclass defaults; **unknown keys
+  fail loudly at load time** (if a branch's `ModelConfig` has different fields,
+  adjust that branch's copy of the yaml instead of relying on silent ignores).
+- Structural errors (`dim % n_heads != 0`, `rotary_dim > head_dim`, odd
+  `n_layers`) are raised at config-load time.
+- `train.py` prints a "Model Configuration" table and records the spec in
+  `wandb.config.model` (alongside the optimizer config capture).
+- Checkpoints are self-describing: `on_save_checkpoint` stores `model_config`
+  in every Lightning checkpoint, so `test.py` rebuilds the matching config
+  automatically (precedence: explicit `--model-config` > checkpoint metadata >
+  `model_0.4b.yaml` fallback with a printed notice). DeepSpeed checkpoint
+  directories carry no such metadata — pass `--model-config` explicitly for
+  them at scales other than 0.4B. A scale mismatch still fails loudly at the
+  strict state-dict load.
+- NanTrap dumps keep working unchanged: `meta.json` records the dataclass as a
+  dict and `reproduce_nan.py` rebuilds it directly.

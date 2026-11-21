@@ -1,0 +1,26 @@
+# ============================================================
+# Model Scale Specification -- 0.4B
+# ============================================================
+# This yaml specifies the model scale ("规格") for training / evaluation.
+# Every entry point (train.py, test.py, fast_test.py) selects it via
+# `--model-config <path>`; the values below are exactly the previous
+# hard-coded ModelConfig defaults, so passing this file is a no-op
+# relative to the historical behaviour.
+#
+# Field semantics follow module/modeling.py::ModelConfig. Unknown keys
+# fail loudly at load time; missing keys fall back to the dataclass
+# defaults. Branches whose ModelConfig has different fields should
+# adjust their own copy of this file.
+#
+# Companion file: model_1.3b.yaml (dim 2048 / n_heads 16, from the fla
+# KDA default configuration, ~1.3B scale).
+# ============================================================
+
+vocab_size: 32000
+n_layers: 24
+dim: 1024
+rotary_dim: 128
+n_heads: 8
+expand_ratio: 4
+rotary_base: 10000
+key_expand: 2
