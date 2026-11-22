@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.modules.mlp import GatedMLP
+from fla.layers import GatedAntiHebbAttention
 from fla.models.cache_utils import Cache
 from jaxtyping import Float, Int
 from torch.utils.checkpoint import checkpoint
@@ -73,7 +74,12 @@ class Layer(nn.Module):
         self.input_norm = nn.RMSNorm(self.dim)
         self.post_norm = nn.RMSNorm(self.dim)
 
-        self.attn = AttentionBlock(layer_idx=self.layer_idx, dim=self.dim, n_heads=self.n_heads, rotary_emb_dim=self.rotary_dim)
+        self.attn = GatedAntiHebbAttention(
+            hidden_size=self.dim,
+            head_dim=self.head_dim,
+            num_heads=self.n_heads,
+            layer_idx=layer_idx
+        )
         self.mlp = GatedMLP(hidden_size=config.dim, hidden_ratio=config.expand_ratio)
 
     def forward(
