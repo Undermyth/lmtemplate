@@ -19,8 +19,8 @@ A lightweight and modular training template for language model pre-training and 
 │   └── modeling.py        # HuggingFace-style architecture (RotaryEmbedding, Layer, LanguageModel, ModelForCausalLM)
 ├── data/
 │   └── stream_parquet.py  # Streaming dataset loader for parquet files
-├── model_0.4b.yaml        # Model scale spec: 0.4B (previous hard-coded defaults)
-├── model_1.3b.yaml        # Model scale spec: 1.3B (fla KDA default configuration)
+├── model_0.4b.yaml        # Model scale spec: 0.4B
+├── model_1.3b.yaml        # Model scale spec: 1.3B
 ├── train.py               # Training script (Lightning-based)
 ├── test.py                # Evaluation script (lm_eval-based)
 ├── model.py               # LightningModule wrapper with optimizer configuration
@@ -194,14 +194,7 @@ The model scale is specified in a yaml file instead of being hard-coded in
 it via `--model-config <path>`; the path is resolved as given first (absolute or
 cwd-relative), then relative to the repository root.
 
-Two specs ship with the template:
-
-| File | Scale | Notes |
-|------|-------|-------|
-| `model_0.4b.yaml` | 0.4B | exactly the previous hard-coded `ModelConfig` defaults |
-| `model_1.3b.yaml` | ~1.3B | `dim 2048 / n_heads 16` (head_dim 128 unchanged) from fla's KDA default configuration (`fla/models/kda/configuration_kda.py`); ~1.37B on the full-attention main architecture, ~1.3B on the linear-attention branches |
-
-Fields (semantics follow `module/modeling.py::ModelConfig`):
+Default fields (semantics follow `module/modeling.py::ModelConfig`):
 
 ```yaml
 vocab_size: 32000
@@ -211,7 +204,6 @@ rotary_dim: 128
 n_heads: 8           # 1.3B spec: 16
 expand_ratio: 4
 rotary_base: 10000
-key_expand: 2
 ```
 
 Behavior and safety:

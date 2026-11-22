@@ -1,16 +1,9 @@
 # ============================================================
 # Model Scale Specification -- 1.3B
 # ============================================================
-# This yaml specifies the model scale ("规格") for training / evaluation.
+# This yaml specifies the model scale for training / evaluation.
 # Every entry point (train.py, test.py, fast_test.py) selects it via
 # `--model-config <path>`.
-#
-# The scale follows the defaults of fla's KDA configuration
-# (fla/models/kda/configuration_kda.py): hidden_size 2048 -> dim,
-# num_heads 16 -> n_heads (head_dim stays 128), num_hidden_layers 24,
-# hidden_ratio 4 -> expand_ratio. Measured on the full-attention main
-# architecture: ~1.37B parameters; on the linear-attention branches
-# (~1.3B), as intended.
 #
 # Field semantics follow module/modeling.py::ModelConfig. Unknown keys
 # fail loudly at load time; missing keys fall back to the dataclass
@@ -25,4 +18,4 @@ rotary_dim: 128
 n_heads: 16
 expand_ratio: 4
 rotary_base: 10000
-key_expand: 2
+key_expand: 1
