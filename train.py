@@ -110,6 +110,21 @@ def wandb_log_code(wandb_run):
     wandb_run.log_code("./")
 
 
+@rank_zero_only
+def wandb_log_model_config(wandb_run, model_config, config_file):
+    """Capture the model scale spec on the dashboard, alongside the optimizer config.
+
+    Must be @rank_zero_only: under Lightning's DDP subprocess launcher, non-zero
+    local ranks re-execute train.py with LOCAL_RANK set, and `logger.experiment`
+    returns a no-op `_DummyExperiment` there whose attribute access yields plain
+    functions (`run.config.update` would crash with "'function' object has no
+    attribute 'update'")."""
+    wandb_run.config.update(
+        {"model": {**asdict(model_config), "config_file": config_file}},
+        allow_val_change=True,
+    )
+
+
 def describe_group_match(spec) -> str:
     """Human-readable description of a param group's matching rule."""
     if spec.source is not None:
@@ -272,11 +287,7 @@ if args.log_to_wandb:
     logger = WandbLogger(project=args.wandb_project, name=args.wandb_runname)
     wandb_run = logger.experiment
     wandb_log_code(wandb_run)
-    # capture the model scale spec on the dashboard, alongside the optimizer config
-    wandb_run.config.update(
-        {"model": {**asdict(config), "config_file": args.model_config}},
-        allow_val_change=True,
-    )
+    wandb_log_model_config(wandb_run, config, args.model_config)
 else:
     logger = CSVLogger(save_dir='./logs/', flush_logs_every_n_steps=50)
 
