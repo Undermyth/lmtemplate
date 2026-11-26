@@ -158,6 +158,7 @@ def log_optimizer_config(optimize_config, wandb_run=None):
         ("min_lr_frac", optimize_config.min_lr_frac),
         ("weight_decay", optimize_config.weight_decay),
         ("grad_clip", optimize_config.grad_clip),
+        ("ns_method", optimize_config.ns_method),
     ]
     for key, val in rows:
         display = "None (disabled)" if val is None else str(val)

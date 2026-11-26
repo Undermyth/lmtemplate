@@ -321,6 +321,7 @@ class LanguageModel(NanTrapMixin, L.LightningModule):
             peak_lr=peak_lr,
             global_weight_decay=self.optimize_config.weight_decay,
             optimizer_type="muon",
+            ns_method=self.optimize_config.ns_method,
         )
         validate_param_coverage(self.model, param_groups, uncovered)
 

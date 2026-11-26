@@ -55,6 +55,24 @@ def _coerce_float(value: object, key: str, default: Optional[float]) -> Optional
     return f
 
 
+NS_METHODS = ("standard", "gram")
+
+
+def _validate_ns_method(value: Optional[str], field_name: str) -> str:
+    """Validate a Newton-Schulz method name.
+
+    ``"standard"`` is the original quintic iteration (run in bf16); ``"gram"`` is
+    the Gram iteration (run in fp16, ~2x faster on rectangular matrices).  Both
+    names are the ones deepspeed's Muon accepts (``NS_METHODS`` in
+    ``deepspeed/runtime/zero/muon/original_muon.py``).
+    """
+    if value is None:
+        return "standard"
+    if value not in NS_METHODS:
+        raise ValueError(f"Invalid {field_name} {value!r}. Expected one of {NS_METHODS}.")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -100,6 +118,14 @@ class ParamGroupSpec:
         use_muon: if ``True``, 2D params in this group are marked with
                   ``p.use_muon = True``.
         muon_momentum: Muon momentum coefficient (used when ``use_muon=True``).
+        ns_method: Newton-Schulz variant for this group: ``"standard"`` (the
+                   original quintic iteration, bf16) or ``"gram"`` (the Gram
+                   iteration, fp16, ~2x faster on rectangular matrices).  ``None``
+                   inherits the global ``OptimizerConfig.ns_method``.  The key
+                   lands in the optimizer param group, which is where deepspeed's
+                   ZeRO-1/2 Muon path reads it from
+                   (``ns_method = optimizer.param_groups[i].get('ns_method', 'gram')``),
+                   so the same value selects the kernel under DDP and under ZeRO.
 
     ``sources`` entries may carry a ``name`` regex filter in addition to
     ``attr``/``dim`` (see :class:`SourceSpec`).
@@ -112,6 +138,7 @@ class ParamGroupSpec:
     betas: Tuple[float, float] = (0.9, 0.95)
     use_muon: bool = False
     muon_momentum: float = 0.95
+    ns_method: Optional[str] = None
 
     def __post_init__(self):
         if self.source is not None and self.sources is not None:
@@ -143,6 +170,7 @@ class ParamGroupSpec:
             "betas": list(self.betas),
             "use_muon": self.use_muon,
             "muon_momentum": self.muon_momentum,
+            "ns_method": self.ns_method,
         }
         if self.source is not None:
             d["source"] = self.source
@@ -165,6 +193,10 @@ class OptimizerConfig:
         weight_decay: global weight decay (inherited by groups with
                       ``weight_decay=None``).
         grad_clip: global gradient clipping value. ``None`` disables clipping.
+        ns_method: global Newton-Schulz variant for the Muon groups: ``"standard"``
+                   (the original quintic iteration, bf16) or ``"gram"`` (the Gram
+                   iteration, fp16, ~2x faster on rectangular matrices).  A group
+                   may override it with its own ``ns_method``.
         param_groups: ordered list of ``ParamGroupSpec``. First-match-wins.
     """
     peak_lr: float = 0.02
@@ -172,6 +204,7 @@ class OptimizerConfig:
     min_lr_frac: float = 0.01
     weight_decay: float = 0.1
     grad_clip: Optional[float] = None
+    ns_method: str = "standard"
     param_groups: List[ParamGroupSpec] = field(default_factory=list)
 
     @classmethod
@@ -210,6 +243,7 @@ class OptimizerConfig:
                 muon_momentum=_coerce_float(
                     g.get("muon_momentum"), f"{gname}.muon_momentum", 0.95
                 ),
+                ns_method=g.get("ns_method"),
             ))
         return cls(
             peak_lr=_coerce_float(d.get("peak_lr"), "peak_lr", 0.02),
@@ -217,6 +251,7 @@ class OptimizerConfig:
             min_lr_frac=_coerce_float(d.get("min_lr_frac"), "min_lr_frac", 0.01),
             weight_decay=_coerce_float(d.get("weight_decay"), "weight_decay", 0.1),
             grad_clip=_coerce_float(d.get("grad_clip"), "grad_clip", None),
+            ns_method=_validate_ns_method(d.get("ns_method"), "ns_method"),
             param_groups=groups,
         )
 
@@ -232,6 +267,7 @@ class OptimizerConfig:
             "min_lr_frac": self.min_lr_frac,
             "weight_decay": self.weight_decay,
             "grad_clip": self.grad_clip,
+            "ns_method": self.ns_method,
             "param_groups": [g.to_dict() for g in self.param_groups],
         }
 
@@ -350,6 +386,7 @@ def build_param_groups(
     peak_lr: float,
     global_weight_decay: float,
     optimizer_type: str = "muon",
+    ns_method: str = "standard",
 ) -> Tuple[List[dict], Set[str]]:
     """Build optimizer-ready ``param_groups`` from declarative specs.
 
@@ -443,6 +480,15 @@ def build_param_groups(
             if spec.use_muon:
                 # Muon group: momentum instead of betas
                 group["momentum"] = spec.muon_momentum
+                # Newton-Schulz variant. It goes into the optimizer param group
+                # because that is where deepspeed's ZeRO-1/2 Muon path reads it
+                # from (stage_1_and_2.py:
+                #   ns_method = optimizer.param_groups[i].get('ns_method', 'gram')),
+                # so the DDP path and the ZeRO path run the same kernel.
+                group["ns_method"] = _validate_ns_method(
+                    spec.ns_method if spec.ns_method is not None else ns_method,
+                    f"ns_method of group '{spec.name}'",
+                )
                 # Mark params for Muon update
                 for p in filtered:
                     p.use_muon = True  # type: ignore[attr-defined]

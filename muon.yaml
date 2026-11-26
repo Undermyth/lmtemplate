@@ -28,6 +28,21 @@ min_lr_frac: 0.001
 weight_decay: 0.1
 grad_clip: null          # null 表示不使用 gradient clipping
 
+# --- Newton-Schulz variant used by the Muon groups ---
+# "standard": the original quintic iteration, run in bf16. This is what the DDP
+#              path has always used.
+# "gram"    : the Gram iteration (iterates on the small square Gram matrix
+#              instead of the full matrix), run in fp16, ~2x faster on the usual
+#              rectangular weight shapes. It is deepspeed's default.
+#
+# The value is written into the Muon optimizer param group, which is where
+# deepspeed's ZeRO-1/2 Muon path reads it from
+# (deepspeed/runtime/zero/stage_1_and_2.py:
+#   ns_method = optimizer.param_groups[i].get('ns_method', 'gram')),
+# so the same kernel runs under DDP and under ZeRO-1/2. A group can override it
+# with its own `ns_method:` key.
+ns_method: standard
+
 # --- Parameter groups (ordered, first-match-wins) ---
 param_groups:
 
